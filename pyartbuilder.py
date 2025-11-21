@@ -1,5 +1,5 @@
 import struct, os, sys
-from PIL import Image, ImageFilter
+from PIL import Image, ImageFilter, ImageChops
 from io import BufferedReader, BufferedWriter
 from pathlib import Path
 from array import array
@@ -37,13 +37,13 @@ def read_palette(filep: Path):
     global g_palette
     tmp: list[int] = []
     with open(filep, "rb") as f:
-        for i in range(256):
+        for i in range(241):
             r = read_unsigned_char(f) * 4
             g = read_unsigned_char(f) * 4
             b = read_unsigned_char(f) * 4
             tmp.extend([r, g, b])
 
-    g_palette = Image.new('P', (16, 16))
+    g_palette = Image.new('P', (16, 15))
     g_palette.putpalette(tmp)
 
  
@@ -77,9 +77,10 @@ def write_unsigned_char(data: int) -> None:
     g_export.extend(struct.pack(C_UCHAR, data))
     g_export_offset += C_UCHAR_LEN
 
-def write_bytearray(data: bytearray) -> None:
+def write_bytearray(data: list[bytes]) -> None:
     global g_export, g_export_offset
-    g_export.extend(data)
+    for byte in data:
+        g_export.extend(byte)
     g_export_offset += len(data)
 
 def ImageToBytes(image: Image.Image, dither: bool) -> bytes:
@@ -88,12 +89,15 @@ def ImageToBytes(image: Image.Image, dither: bool) -> bytes:
     Converts Image to tile, has no picanms set. Operation is destructive to the image input
     """
     # Deal with transparency
+    mask = HandleTransparency(image)
+    fullytransp = Image.new('L', image.size, color=(0xff))
+
     if image.mode != "RGB":
         image = image.convert("RGB")
 
     #result = image.convert('P', dither, palette.get_lookup())
     result = image.quantize(colors= 256, method=Image.Quantize.MEDIANCUT, palette=g_palette, dither=Image.Dither.FLOYDSTEINBERG if dither else Image.Dither.NONE)
-
+    result = Image.composite(fullytransp, result, mask)
 
     #result = image.convert('P', dither=None, palette=g_palette, colors = 256)
     result = result.transpose(Image.Transpose.TRANSPOSE)
@@ -124,18 +128,16 @@ def CorrectImageSize(image: Image.Image) -> Image.Image:
             image2 = image.resize((new_width, new_height), Image.Resampling.NEAREST)
     return image2
 
-def HandleTransparency(image: Image.Image) -> list[tuple[int, int]]:
-    width, height = image.size
-    tmp: list[tuple[int, int]] = []
+def HandleTransparency(image: Image.Image) -> Image.Image:
+    #width, height = image.size
+    image2 = image.convert('RGBA')
+    alpha = image2.split()[-1]
+    alpha = ImageChops.invert(alpha)
+    #print("HandleTransparency called!")
+    #alpha.show()
+    return alpha
 
-    for y in range(height):
-        for x in range(width):
-            r, g, b, a = image.getpixel((x,y))
 
-            if a == 255:
-                tmp.append((x, y))
-
-    return tmp
 
 def print_usage(error: bool) -> None:
     print("TODO: Add usage here!!!")
@@ -144,6 +146,13 @@ def print_usage(error: bool) -> None:
         sys.exit(127)
     
     sys.exit(0)
+
+def has_image_extension(filename: str) -> bool:
+    filename = filename.lower()
+    if filename.endswith('.png') or filename.endswith('.bmp') or filename.endswith('.jpg') or filename.endswith('.tiff') or filename.endswith('.jpeg'):
+        return True
+
+    return False
 
 def build_art(filep: Path):
     global g_art_tile_data, g_art_tilesizex, g_art_tilesizey, g_art_picanms, g_art_lasttile
@@ -159,7 +168,7 @@ def build_art(filep: Path):
         print(f"Warning! Directory name must be 3 digits!")
 
     for f in filep.iterdir():
-        if str(f).endswith('.png') or str(f).endswith('.bmp') or str(f).endswith('.jpg') or str(f).endswith('.tiff'):
+        if has_image_extension(str(f)):
             tilenum = str(f).split(sep='.')[0]
             tilenum = tilenum.split(sep='/')[1]
             # valid file!
@@ -199,10 +208,7 @@ def build_art2(filep: Path):
         write_short(g_art_tilesizey[i])
     for i in range(g_art_numtiles):
         write_long(g_art_picanms[i])
-    for i in range(g_art_numtiles):
-        for j in g_art_tile_data[i]:
-            if g_art_tilesizex[i] != 0 and g_art_tilesizey[i] != 0:
-                write_unsigned_char(j)
+    write_bytearray(g_art_tile_data)
 
     f = open(filep, "wb")
     f.write(g_export)
