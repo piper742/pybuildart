@@ -10,7 +10,7 @@ ART_VERSION = 1
 # I don't know what is actually the max tile size for BUILD (probably sizeof(short) ^ 2),
 # but I feel like this is a sensible maximum from an aesthetic/size point of view
 # TODO: Check if all of D3Ds tiles don't exceed this
-MAX_TILE_SIZE = 256
+MAX_TILE_SIZE = 256.0
 MAX_TILE_SIZE_SQUARE = MAX_TILE_SIZE * MAX_TILE_SIZE
 
 # DO NOT CHANGE
@@ -59,6 +59,7 @@ def is_powerof2(n: int) -> bool:
     return bool(n & (n-1) == 0)
 
 def reinit_globals(filep: Path) -> None:
+    "Reads in config, and accomodates for ART file size"
     global g_art_numtiles, g_art_tilesend, g_art_tilesstart, g_art_tilesizey, g_art_tilesizex, g_art_picanms, g_art_tile_data
 
     try:
@@ -192,6 +193,14 @@ def CorrectImageSize(image: Image.Image) -> Image.Image:
         new_width = int(image.size[0] * scale_ratio)
         new_height = int(image.size[1] * scale_ratio)
 
+        # Tiling textures break on walls if their height is not divisible by 2
+        # I trust that the user is aware of this wall tiling bug, and will only
+        # ever make sprites that break the above rule.
+        # Rescale while maintaining aspect ratio
+        if new_height % 2 != 0:
+            new_height += 1
+            new_width += 1
+
         if image.format == "JPEG":
             image2 = image.resize((new_width, new_height), Image.Resampling.BILINEAR)
         else:
@@ -252,6 +261,7 @@ def configgetattrib(key: str, attrib: str) -> int:
     return 0
 
 def build_art(filep: Path):
+    "Builds internal representation of final ART file"
     global g_art_tile_data, g_art_tilesizex, g_art_tilesizey, g_art_picanms, g_art_lasttile
     weirdnumbering: bool = False
 
@@ -311,9 +321,10 @@ def build_art(filep: Path):
             if tilenum > g_art_lasttile:
                 g_art_lasttile = tilenum
 
-    build_art2(Path(f"tiles{filep}.art"))
+    write_art(Path(f"tiles{filep}.art"))
 
-def build_art2(filep: Path):
+def write_art(filep: Path):
+    "Assembles final ART file in cache, then writes to disc"
     global g_art_numtiles
     if filep.is_dir():
         print("how the hell did this happen?")
@@ -337,7 +348,16 @@ def build_art2(filep: Path):
     _ = f.write(g_export)
     f.close()
 
+def main(args: list[str]) -> None:
+    workdir = Path(args[1])
+    palfile = Path('PALETTE.DAT')
+
+    reinit_globals(workdir)
+    read_palette(palfile)
+    build_art(workdir)
+
 if __name__ == "__main__":
-    reinit_globals(Path(sys.argv[1]))
-    read_palette(Path("PALETTE.DAT"))
-    build_art(Path(sys.argv[1]))
+    main(sys.argv)
+    # reinit_globals(Path(sys.argv[1]))
+    # read_palette(Path("PALETTE.DAT"))
+    # build_art(Path(sys.argv[1]))
