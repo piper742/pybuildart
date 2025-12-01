@@ -31,13 +31,14 @@ C_UCHAR3_UNPACK = struct.Struct(C_UCHAR3).unpack_from
 # the sets aren't used anywhere, reference only
 ART_CONFIG_OPTIONS: set[str] = { 'numtiles', 'starttile' }
 TILE_CONFIG_OPTIONS: set[str] = { 'x', 'y', 'frames', 'animtype', 'speed', 'dither' }
+DEFAULT_CONFIG: dict[str, dict[str, int]] = {'art': {'start': 0, 'end': 255}}
 g_config = dict()
 
 # 241 color palette (excludes fullbright colors)
 g_palette: Image.Image = Image.Image()
 
 # Contains the tilesend-tilesstart+1
-g_art_numtiles: int = 0
+g_art_numtiles: int = 256
 # Contains real amount of tiles
 g_art_lasttile: int = 0
 
@@ -65,7 +66,10 @@ def reinit_globals(filep: Path) -> None:
     try:
         read_config(filep / 'config.toml')
     except:
-        print("Config file not present, using defaults!")
+        if not (filep / 'config.toml').exists():
+            with open((filep / 'config.toml'), "w") as f:
+                print("Config file not present, creating default!")
+                _ = toml.dump(o=DEFAULT_CONFIG, f=f)
         return
 
     g_art_tilesstart = configgetattrib('art', 'start')
@@ -98,7 +102,7 @@ def read_config(filep: Path) -> None:
     except Exception as error:
         print(f"Couldn't find/parse config file: {filep}")
         print(error)
-        sys.exit(1)
+        raise Exception('Hack cuz Im lazy')
 
 def read_palette(filep: Path):
     global g_palette
@@ -220,7 +224,29 @@ def HandleTransparency(image: Image.Image) -> Image.Image:
     return alpha
 
 def print_usage(error: bool) -> None:
-    print("TODO: Add usage here!!!")
+    print("""Usage: pyartbuild [art_id]
+
+       DESCRIPTION:
+       Create a BUILD engine ART file from a directory.
+       art_id=DIRECTORY
+                A directory which is named 3 digits which corresponds
+                to the resulting tiles###.art file's number.
+       In the working directory a PALETTE.DAT file is required. A RAW
+       256 color RGB palette will also work. The last 16 fullbright
+       colors are omitted during palettization.
+       The directory containing the input images needs to have a
+       config.toml file, which gets generated on first use.
+       Each tile can have attributes set in this file by specifying
+       [tilenumber] with the following properties:
+       'x' & 'y'  - configures offset
+       'frames'   - specifies number of frames part of animation
+       'speed'    - speed of the animation
+       'animtype' - specifies type of the animation, which can be:
+                      'none' (noanim, null, 0)
+                      'oscillate' (sin, cos, 1)
+                      'forward' (fw, fd, 2)
+                      'backward' (bk, bw, 3)
+       'dither'   - whether to dither the tile during palettization""")
 
     if error:
         sys.exit(1)
@@ -264,6 +290,8 @@ def build_art(filep: Path):
     "Builds internal representation of final ART file"
     global g_art_tile_data, g_art_tilesizex, g_art_tilesizey, g_art_picanms, g_art_lasttile
     weirdnumbering: bool = False
+    # Number of tiles above end of artfile
+    overflow: int = 0
 
     if not filep.exists():
         print(f"The given path {filep} doesn't exist!")
@@ -298,8 +326,10 @@ def build_art(filep: Path):
             if weirdnumbering:
                tilenum -= g_art_tilesstart 
 
-            if tilenum > g_art_numtiles:
-                print(f"Image no. {tilenum} is larger than amount of tiles in file! Ignoring!")
+            if tilenum > g_art_numtiles-1:
+                if overflow < 3:
+                    print(f"Image no. {tilenum} is larger than amount of tiles in file! Ignoring!")
+                overflow += 1
                 continue
 
             img = Image.open(f)
@@ -320,6 +350,10 @@ def build_art(filep: Path):
 
             if tilenum > g_art_lasttile:
                 g_art_lasttile = tilenum
+
+    if overflow > 3:
+        overflow -= 3
+        print(f"...and {overflow} more!")
 
     write_art(Path(f"tiles{filep}.art"))
 
@@ -348,8 +382,11 @@ def write_art(filep: Path):
     _ = f.write(g_export)
     f.close()
 
-def main(args: list[str]) -> None:
-    workdir = Path(args[1])
+def main() -> None:
+    if len(sys.argv) != 2:
+        print_usage(False)
+
+    workdir = Path(sys.argv[1])
     palfile = Path('PALETTE.DAT')
 
     reinit_globals(workdir)
@@ -357,7 +394,5 @@ def main(args: list[str]) -> None:
     build_art(workdir)
 
 if __name__ == "__main__":
-    main(sys.argv)
-    # reinit_globals(Path(sys.argv[1]))
-    # read_palette(Path("PALETTE.DAT"))
-    # build_art(Path(sys.argv[1]))
+    main()
+
