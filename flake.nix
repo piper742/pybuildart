@@ -21,9 +21,8 @@
           (python313.withPackages (python-pkgs: with python-pkgs; [
           basedpyright
           pillow
-          numpy
+          toml
           pip
-          tkinter
           ]))
         ];
       };
