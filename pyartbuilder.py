@@ -11,6 +11,7 @@ ART_VERSION = 1
 # but I feel like this is a sensible maximum from an aesthetic/size point of view
 # TODO: Check if all of D3Ds tiles don't exceed this
 MAX_TILE_SIZE = 256
+MAX_TILE_SIZE_SQUARE = MAX_TILE_SIZE * MAX_TILE_SIZE
 
 # DO NOT CHANGE
 C_SHORT = "<h"
@@ -22,6 +23,9 @@ C_LONG_UNPACK = struct.Struct(C_LONG).unpack_from
 C_UCHAR = "<B"
 C_UCHAR_LEN = struct.calcsize(C_UCHAR)
 C_UCHAR_UNPACK = struct.Struct(C_UCHAR).unpack_from
+C_UCHAR3 = "<BBB"
+C_UCHAR3_LEN = struct.calcsize(C_UCHAR3)
+C_UCHAR3_UNPACK = struct.Struct(C_UCHAR3).unpack_from
 
 # TOML config
 # the sets aren't used anywhere, reference only
@@ -49,6 +53,42 @@ g_export: bytearray = bytearray(0)
 # Not used anywhere, but should still be valid
 g_export_offset: int = 0
 
+
+def is_powerof2(n: int) -> bool:
+    "Is power of 2. Zero returns true"
+    return bool(n & (n-1) == 0)
+
+def reinit_globals(filep: Path) -> None:
+    global g_art_numtiles, g_art_tilesend, g_art_tilesstart, g_art_tilesizey, g_art_tilesizex, g_art_picanms, g_art_tile_data
+
+    try:
+        read_config(filep / 'config.toml')
+    except:
+        print("Config file not present, using defaults!")
+        return
+
+    g_art_tilesstart = configgetattrib('art', 'start')
+    g_art_tilesend = configgetattrib('art', 'end')
+    if g_art_tilesstart > g_art_tilesend or g_art_tilesstart == g_art_tilesend:
+        print("Invalid ART start & end values!")
+        print_usage(error=True)
+
+    if not is_powerof2(g_art_tilesstart):
+        print("WARNING: ART start is not power of 2! This will cause issues!")
+    if not is_powerof2(g_art_tilesend+1):
+        print("""
+        WARNING: ART end is not power of 2! This will cause issues!
+        You have to use a power of 2 value minus 1 to account for
+        the very first tile starting at zero!
+              """)
+
+    g_art_numtiles = g_art_tilesend - g_art_tilesstart + 1
+
+    g_art_tilesizex = array('H', [0] * g_art_numtiles)
+    g_art_tilesizey = array('H', [0] * g_art_numtiles)
+    g_art_picanms = array('l', [0] * g_art_numtiles)
+    g_art_tile_data = [bytes(0)] * g_art_numtiles
+
 def read_config(filep: Path) -> None:
     global g_config
     try:
@@ -57,23 +97,25 @@ def read_config(filep: Path) -> None:
     except Exception as error:
         print(f"Couldn't find/parse config file: {filep}")
         print(error)
+        sys.exit(1)
 
 def read_palette(filep: Path):
     global g_palette
     tmp: list[int] = []
     try:
         with open(filep, "rb") as f:
-            for i in range(241):
-                r = read_unsigned_char(f) * 4
-                g = read_unsigned_char(f) * 4
-                b = read_unsigned_char(f) * 4
-                tmp.extend([r, g, b])
+            for _ in range(240):
+                rgb = read_3_unsigned_chars(f)
+                
+                # Undo a DOS optimization by multiplying the palette values by 4
+                tmp.extend(map(( lambda c: c << 2 ), rgb))
 
         g_palette = Image.new('P', (16, 15))
         g_palette.putpalette(tmp)
     except Exception as error:
         print("Failed to read PALETTE.DAT")
         print("Error: ", error)
+        sys.exit(65)
 
 def read_short(file: BufferedReader) -> int:
     return C_SHORT_UNPACK(
@@ -86,6 +128,10 @@ def read_long(file: BufferedReader) -> int:
 def read_unsigned_char(file: BufferedReader) -> int:
     return C_UCHAR_UNPACK(
             file.read(C_UCHAR_LEN))[0]
+
+def read_3_unsigned_chars(file: BufferedReader) -> tuple[int]:
+    return C_UCHAR3_UNPACK(
+            file.read(C_UCHAR3_LEN))
 
 def write_short(data: int) -> None:
     global g_export, g_export_offset
@@ -136,7 +182,7 @@ def ImageToBytes(image: Image.Image, dither: bool) -> bytes:
 
 def CorrectImageSize(image: Image.Image) -> Image.Image:
     image2 = image
-    if (image.size[0] * image.size[1]) > (MAX_TILE_SIZE * MAX_TILE_SIZE):
+    if (image.size[0] * image.size[1]) > MAX_TILE_SIZE_SQUARE:
         width_ratio = MAX_TILE_SIZE / image.size[0]
         height_ratio = MAX_TILE_SIZE / image.size[1]
         
@@ -168,7 +214,7 @@ def print_usage(error: bool) -> None:
     print("TODO: Add usage here!!!")
 
     if error:
-        sys.exit(127)
+        sys.exit(1)
     
     sys.exit(0)
 
@@ -207,6 +253,8 @@ def configgetattrib(key: str, attrib: str) -> int:
 
 def build_art(filep: Path):
     global g_art_tile_data, g_art_tilesizex, g_art_tilesizey, g_art_picanms, g_art_lasttile
+    weirdnumbering: bool = False
+
     if not filep.exists():
         print(f"The given path {filep} doesn't exist!")
         print_usage(True)
@@ -218,7 +266,11 @@ def build_art(filep: Path):
     if len(str(filep)) != 3:
         print(f"Warning! Directory name must be 3 digits!")
 
-    read_config(filep / 'config.toml')
+    # Start of ART file is not zero, and the image naming scheme matches that
+    # To me doing this seems insanely impractical... Let's hope this code works on Windows
+    if filep.glob('./[0-9].*', case_sensitive=False, recurse_symlinks=True
+                  ) and configgetattrib('art', 'start') > 0:
+        weirdnumbering = True
 
     for f in filep.iterdir():
         if has_image_extension(str(f)):
@@ -232,6 +284,13 @@ def build_art(filep: Path):
             
             dither: bool = False
             tilenum = int(tilenum)
+
+            if weirdnumbering:
+               tilenum -= g_art_tilesstart 
+
+            if tilenum > g_art_numtiles:
+                print(f"Image no. {tilenum} is larger than amount of tiles in file! Ignoring!")
+                continue
 
             img = Image.open(f)
             img = CorrectImageSize(img)
@@ -258,7 +317,7 @@ def build_art2(filep: Path):
     global g_art_numtiles
     if filep.is_dir():
         print("how the hell did this happen?")
-        sys.exit(127)
+        sys.exit(1)
 
     g_art_numtiles = g_art_tilesend - g_art_tilesstart + 1
 
@@ -279,5 +338,6 @@ def build_art2(filep: Path):
     f.close()
 
 if __name__ == "__main__":
+    reinit_globals(Path(sys.argv[1]))
     read_palette(Path("PALETTE.DAT"))
     build_art(Path(sys.argv[1]))
