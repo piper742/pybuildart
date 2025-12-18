@@ -199,7 +199,7 @@ def CorrectImageSize(image: Image.Image) -> Image.Image:
 
         # Tiling textures break on walls if their height is not divisible by 2
         # I trust that the user is aware of this wall tiling bug, and will only
-        # ever make sprites that break the above rule.
+        # ever make sprites for actors that break the above rule.
         # Rescale while maintaining aspect ratio
         if new_height % 2 != 0:
             new_height += 1
@@ -215,11 +215,11 @@ def HandleTransparency(image: Image.Image) -> Image.Image:
     image2 = image.convert('RGBA')
 
     alpha = image2.split()[-1]
-    alpha = ImageChops.invert(alpha)
+    #alpha = ImageChops.invert(alpha)
 
-    # Clamp between 255 and 0
+    # Invert alpha & clamp values between 255 and 0
     # This threshold works perfectly for my horribly rotoscoped foliage
-    alpha = alpha.point(lambda a: 255 if a > 240 else 0)
+    alpha = alpha.point(lambda a: 255 if a <= 20 else 0)
 
     return alpha
 
@@ -306,7 +306,9 @@ def build_art(filep: Path):
 
     # Start of ART file is not zero, and the image naming scheme matches that
     # To me doing this seems insanely impractical... Let's hope this code works on Windows
-    if filep.glob('./[0-9].*', case_sensitive=False, recurse_symlinks=True
+    if filep.glob('./[0-9].*',
+                  case_sensitive=False,
+                  recurse_symlinks=True
                   ) and configgetattrib('art', 'start') > 0:
         weirdnumbering = True
 
