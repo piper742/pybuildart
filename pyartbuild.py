@@ -3,6 +3,7 @@ from PIL import Image, ImageChops
 from io import BufferedReader
 from pathlib import Path
 from array import array
+from contextlib import contextmanager
 import toml
 
 # DO NOT CHANGE
@@ -54,6 +55,13 @@ g_export: bytearray = bytearray(0)
 # Not used anywhere, but should still be valid
 g_export_offset: int = 0
 
+@contextmanager
+def PILImage(filep: Path):
+    img = Image.open(filep)
+    try:
+        yield img
+    finally:
+        img.close()
 
 def is_powerof2(n: int) -> bool:
     "Is power of 2. Zero returns true"
@@ -334,24 +342,24 @@ def build_art(filep: Path):
                 overflow += 1
                 continue
 
-            img = Image.open(f)
-            img = CorrectImageSize(img)
-            g_art_tilesizex[tilenum] = img.size[0]
-            g_art_tilesizey[tilenum] = img.size[1]
+            with PILImage(f) as img:
+                img = CorrectImageSize(img)
+                g_art_tilesizex[tilenum] = img.size[0]
+                g_art_tilesizey[tilenum] = img.size[1]
 
-            strtilenum = str(tilenum)
-            dither = bool(configgetattrib(strtilenum, 'dither'))
-            animspeed = ( configgetattrib(strtilenum, 'speed') << 24 ) & 0xF000000
-            frames = configgetattrib(strtilenum, 'frames') & 0x3F
-            animtype = ( configgetattrib(strtilenum, 'animtype') << 6 ) & 0xC0
-            xofs = ( configgetattrib(strtilenum, 'x') << 8 ) & 0xFF00
-            yofs = ( configgetattrib(strtilenum, 'y') << 16 ) & 0xFF0000
+                strtilenum = str(tilenum)
+                dither = bool(configgetattrib(strtilenum, 'dither'))
+                animspeed = ( configgetattrib(strtilenum, 'speed') << 24 ) & 0xF000000
+                frames = configgetattrib(strtilenum, 'frames') & 0x3F
+                animtype = ( configgetattrib(strtilenum, 'animtype') << 6 ) & 0xC0
+                xofs = ( configgetattrib(strtilenum, 'x') << 8 ) & 0xFF00
+                yofs = ( configgetattrib(strtilenum, 'y') << 16 ) & 0xFF0000
  
-            g_art_picanms[tilenum] = ( animspeed | frames | animtype | xofs| yofs )
-            g_art_tile_data[tilenum] = ImageToBytes(img, dither)
+                g_art_picanms[tilenum] = ( animspeed | frames | animtype | xofs| yofs )
+                g_art_tile_data[tilenum] = ImageToBytes(img, dither)
 
-            if tilenum > g_art_lasttile:
-                g_art_lasttile = tilenum
+                if tilenum > g_art_lasttile:
+                    g_art_lasttile = tilenum
 
     if overflow > 3:
         overflow -= 3
