@@ -81,18 +81,17 @@ def reinit_globals(filep: Path) -> None:
         return
 
     g_art_tilesstart = configgetattrib('art', 'start')
-    g_art_tilesend = configgetattrib('art', 'end')
+    g_art_tilesend = g_art_tilesstart + (configgetattrib('art', 'length') - 1)
     if g_art_tilesstart > g_art_tilesend or g_art_tilesstart == g_art_tilesend:
         print("Invalid ART start & end values!")
         print_usage(error=True)
 
-    if not is_powerof2(g_art_tilesstart):
-        print("WARNING: ART start is not power of 2! This will cause issues!")
-    if not is_powerof2(g_art_tilesend+1):
+    if (g_art_tilesstart % configgetattrib('art', 'length')) != 0:
+        print("WARNING: ART start is not a multiple of length! This could cause issues!")
+    if not is_powerof2(configgetattrib('art', 'length')):
         print("""
-        WARNING: ART end is not power of 2! This will cause issues!
-        You have to use a power of 2 value minus 1 to account for
-        the very first tile starting at zero!
+        WARNING: ART length is not power of 2! This will cause issues!
+        You have to use a power of 2 value!
               """)
 
     g_art_numtiles = g_art_tilesend - g_art_tilesstart + 1
@@ -355,7 +354,7 @@ def build_art(filep: Path):
                 xofs = ( configgetattrib(strtilenum, 'x') << 8 ) & 0xFF00
                 yofs = ( configgetattrib(strtilenum, 'y') << 16 ) & 0xFF0000
  
-                g_art_picanms[tilenum] = ( animspeed | frames | animtype | xofs| yofs )
+                g_art_picanms[tilenum] = ( animspeed | frames | animtype | xofs | yofs )
                 g_art_tile_data[tilenum] = ImageToBytes(img, dither)
 
                 if tilenum > g_art_lasttile:
