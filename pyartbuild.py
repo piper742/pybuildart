@@ -31,8 +31,8 @@ C_UCHAR3_UNPACK = struct.Struct(C_UCHAR3).unpack_from
 # TOML config
 # the sets aren't used anywhere, reference only
 ART_CONFIG_OPTIONS: set[str] = { 'numtiles', 'starttile' }
-TILE_CONFIG_OPTIONS: set[str] = { 'x', 'y', 'frames', 'animtype', 'speed', 'dither' }
-DEFAULT_CONFIG: dict[str, dict[str, int]] = {'art': {'start': 0, 'end': 255}}
+TILE_CONFIG_OPTIONS: set[str] = { 'x', 'y', 'frames', 'animtype', 'speed', 'dither', 'offscorrect', 'nocorrectx', 'nocorrecty', 'correct_pivot_x', 'correct_pivot_y' }
+DEFAULT_CONFIG: dict[str, dict[str, int]] = {'art': {'start': 0, 'length': 256}}
 g_config = dict()
 
 # 241 color palette (excludes fullbright colors)
@@ -51,6 +51,11 @@ g_art_tilesizey: array[int] = array('H', [0] * 256)
 g_art_picanms: array[int] = array('l', [0] * 256)
 g_art_tile_data: list[bytes] = [bytes(0)] * 256
 g_export: bytearray = bytearray(0)
+
+g_offscorrect_remaining: int = 0
+g_offscorrect_reference_tile: int = 0
+g_offscorrect_mode: int = 0
+g_offscorrect_pivot: list[ int | None ] = [None] * 4
 
 # Not used anywhere, but should still be valid
 g_export_offset: int = 0
@@ -230,6 +235,17 @@ def HandleTransparency(image: Image.Image) -> Image.Image:
 
     return alpha
 
+def correct_offset(old_size: int, new_size: int, old_offset: int, old_pivot: int | None, new_pivot: int | None) -> int:
+    """
+    Corrects the new offset to point to the same pixel based off the old one, with
+    an optional pivot (meant to be used with a 3D model's bones projected 2D coordinates eg. hand joint in viewmodel,
+    though it can theoretically be a tracking marker's projected 2D coordinates from VFX/3D software)
+    """
+    if isinstance(old_pivot, int) and isinstance(new_pivot, int):
+        return round(old_offset + (old_pivot - new_pivot) - (old_size - new_size) / 2.0)
+    else:
+        return round(old_offset + (new_size - old_size) / 2.0)
+
 def print_usage(error: bool) -> None:
     print("""Usage: pyartbuild [art_id]
 
@@ -245,15 +261,34 @@ def print_usage(error: bool) -> None:
        config.toml file, which gets generated on first use.
        Each tile can have attributes set in this file by specifying
        [tilenumber] with the following properties:
-       'x' & 'y'  - configures offset
-       'frames'   - specifies number of frames part of animation
-       'speed'    - speed of the animation
-       'animtype' - specifies type of the animation, which can be:
-                      'none' (noanim, null, 0)
-                      'oscillate' (sin, cos, 1)
-                      'forward' (fw, fd, 2)
-                      'backward' (bk, bw, 3)
-       'dither'   - whether to dither the tile during palettization""")
+       'x' & 'y'         - configures offset
+       'frames'          - specifies number of frames part of animation
+       'speed'           - speed of the animation
+       'animtype'        - specifies type of the animation, which can be:
+                           'none' (noanim, null, 0)
+                           'oscillate' (sin, cos, 1)
+                           'forward' (fw, fd, 2)
+                           'backward' (bk, bw, 3)
+       'offscorrect'     - Intended for use with animations, weapon views.
+                           The value should be set to the number of tiles
+                           in the sequence.
+                           Corrects the offsets for size changes during the
+                           tile sequence.
+                           Only works forwards! Overwrites all offsets for the
+                           tiles in the sequence unless specified otherwise
+                           with 'nocorrectx' & 'nocorrecty'
+       'correct_pivot_x'
+       'correct_pivot_y' - Sets a "pivot" point for the offset correction.
+                           The pivot must be defined for all tiles in the
+                           sequence. The pivot must be specified in a top-
+                           -left origin coordinate system. The input data
+                           for example could be the 2D projected coordinate
+                           of a marker in 3D space or a model's joint's coordinates
+       'nocorrectx'
+       'nocorrecty'      - Prevents overwriting of the specified offset with
+                           the corrected value. Must be specified per-tile
+                           in the sequence.
+       'dither'          - whether to dither the tile during palettization""")
 
     if error:
         sys.exit(1)
@@ -273,7 +308,7 @@ def configgetattrib(key: str, attrib: str) -> int:
         if attrib in g_config[key].keys():
             if isinstance(g_config[key][attrib], str):
                 s_attrib = str(g_config[key][attrib]).lower()
-                if attrib == 'dither':
+                if attrib == 'dither' or attrib == 'nocorrectx' or attrib == 'nocorrecty':
                     if s_attrib == "true":
                         return 1
                     else:
@@ -290,13 +325,18 @@ def configgetattrib(key: str, attrib: str) -> int:
                     else:
                         print(f"Invalid animtype keyvalue!")
                 return 0
+
+            # Ugly hack so that I don't have to deal with typing errors from
+            # having an union of int and none be returned by this function
+            if attrib == "correct_pivot_x" or attrib == "correct_pivot_y":
+                return g_config[key][attrib] + 1
             return g_config[key][attrib]
 
     return 0
 
 def build_art(filep: Path):
     "Builds internal representation of final ART file"
-    global g_art_tile_data, g_art_tilesizex, g_art_tilesizey, g_art_picanms, g_art_lasttile
+    global g_art_tile_data, g_art_tilesizex, g_art_tilesizey, g_art_picanms, g_art_lasttile, g_offscorrect_remaining, g_offscorrect_reference_tile, g_offscorrect_mode, g_offscorrect_pivot
     weirdnumbering: bool = False
     # Number of tiles above end of artfile
     overflow: int = 0
@@ -356,6 +396,48 @@ def build_art(filep: Path):
                 animtype = ( configgetattrib(strtilenum, 'animtype') << 6 ) & 0xC0
                 xofs = ( configgetattrib(strtilenum, 'x') << 8 ) & 0xFF00
                 yofs = ( configgetattrib(strtilenum, 'y') << 16 ) & 0xFF0000
+                g_offscorrect_pivot[0] = configgetattrib(strtilenum, 'correct_pivot_x')
+                g_offscorrect_pivot[1] = configgetattrib(strtilenum, 'correct_pivot_y')
+
+                if (configgetattrib(strtilenum, 'offscorrect') > 0):
+                    g_offscorrect_remaining = configgetattrib(strtilenum, 'offscorrect')
+                    g_offscorrect_reference_tile = tilenum
+                    g_offscorrect_mode = 0
+                    g_offscorrect_mode = g_offscorrect_mode | configgetattrib(strtilenum, 'nocorrectx') << 0
+                    g_offscorrect_mode = g_offscorrect_mode | configgetattrib(strtilenum, 'nocorrecty') << 1
+                    g_offscorrect_pivot[2] = g_offscorrect_pivot[0]
+                    g_offscorrect_pivot[3] = g_offscorrect_pivot[1]
+
+                if tilenum > g_offscorrect_reference_tile and g_offscorrect_remaining > 0:
+                    prev_xofs = (g_art_picanms[g_offscorrect_reference_tile] & 0xFF00) >> 8
+                    prev_yofs = (g_art_picanms[g_offscorrect_reference_tile] & 0xFF0000) >> 16
+                    # Mark zero as None, specifically for passing into correct_offset function
+                    g_offscorrect_pivot = [None if i == 0 else i for i in g_offscorrect_pivot]
+                    # Undo hacky marking that was used to mark this as none
+                    g_offscorrect_pivot = [i - 1 if i != None else i for i in g_offscorrect_pivot]
+
+                    if None in g_offscorrect_pivot[:2] and not None in g_offscorrect_pivot[2:]:
+                        print(f"Warning! Pivot not set for tile {tilenum} belonging to correction offset range of {g_offscorrect_reference_tile}")
+
+                    if not g_offscorrect_mode & 1:
+                        xofs = (correct_offset(old_size=g_art_tilesizex[g_offscorrect_reference_tile],
+                                             new_size=g_art_tilesizex[tilenum],
+                                             old_offset=prev_xofs,
+                                             old_pivot=g_offscorrect_pivot[2],
+                                             new_pivot=g_offscorrect_pivot[0]) << 8) & 0xFF00
+                    #else:
+                    #    xofs = prev_xofs << 8
+
+                    if not g_offscorrect_mode & 2:
+                        yofs = (correct_offset(old_size=g_art_tilesizey[g_offscorrect_reference_tile],
+                                             new_size=g_art_tilesizey[tilenum],
+                                             old_offset=prev_yofs,
+                                             old_pivot=g_offscorrect_pivot[3],
+                                             new_pivot=g_offscorrect_pivot[1]) << 16) & 0xFF0000
+                    #else:
+                    #    yofs = prev_yofs << 16
+
+                    g_offscorrect_remaining -= 1
  
                 g_art_picanms[tilenum] = ( animspeed | frames | animtype | xofs | yofs )
                 g_art_tile_data[tilenum] = ImageToBytes(img, dither)
