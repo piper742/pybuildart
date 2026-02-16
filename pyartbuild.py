@@ -264,7 +264,8 @@ def has_image_extension(filename: str) -> bool:
     filename = filename.lower()
     valid_extensions = {'.png', '.bmp', '.jpg', '.jpeg', '.tiff', '.j2p', '.jpx', '.jfif',
                         '.pcx', '.ppm', '.pgm', '.pbm', '.webp', '.xbm', '.dcx', '.ico',
-                        '.icns', '.imt', '.pcd', '.psd', '.tga', '.xpm', '.im', '.eps'}
+                        '.icns', '.imt', '.pcd', '.psd', '.tga', '.xpm', '.im', '.eps',
+                        '.j2k', '.jp2', '.dib', '.dds', '.avif', '.qoi', '.fits', '.pcd'}
     return any(filename.endswith(extension) for extension in valid_extensions)
 
 def configgetattrib(key: str, attrib: str) -> int:
