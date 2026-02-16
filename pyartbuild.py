@@ -319,7 +319,7 @@ def build_art(filep: Path):
                   ) and configgetattrib('art', 'start') > 0:
         weirdnumbering = True
 
-    for f in filep.iterdir():
+    for f in sorted(filep.iterdir()):
         if has_image_extension(str(f)):
             tilenum = str(f).split(sep='.')[0]
             tilenum = tilenum.split(sep='/')[1]
@@ -331,6 +331,9 @@ def build_art(filep: Path):
             
             dither: bool = False
             tilenum = int(tilenum)
+
+            # Keep weird numbering to match the config
+            strtilenum = str(tilenum)
 
             if weirdnumbering:
                tilenum -= g_art_tilesstart 
@@ -346,7 +349,6 @@ def build_art(filep: Path):
                 g_art_tilesizex[tilenum] = img.size[0]
                 g_art_tilesizey[tilenum] = img.size[1]
 
-                strtilenum = str(tilenum)
                 dither = bool(configgetattrib(strtilenum, 'dither'))
                 animspeed = ( configgetattrib(strtilenum, 'speed') << 24 ) & 0xF000000
                 frames = configgetattrib(strtilenum, 'frames') & 0x3F
