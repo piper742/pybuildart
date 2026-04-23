@@ -5,6 +5,7 @@ from pathlib import Path
 from array import array
 from contextlib import contextmanager
 import toml
+from math import floor
 
 # DO NOT CHANGE
 ART_VERSION = 1
@@ -242,9 +243,10 @@ def correct_offset(old_size: int, new_size: int, old_offset: int, old_pivot: int
     though it can theoretically be a tracking marker's projected 2D coordinates from VFX/3D software)
     """
     if isinstance(old_pivot, int) and isinstance(new_pivot, int):
-        return round(old_offset + (old_pivot - new_pivot) - (old_size - new_size) / 2.0)
+        cx = old_offset + (old_pivot - old_size) / 2.0
+        return floor(( cx - (new_pivot - new_size) / 2.0))
     else:
-        return round(old_offset + (new_size - old_size) / 2.0)
+        return floor(old_offset + (new_size - old_size) / 2.0)
 
 def print_usage(error: bool) -> None:
     print("""Usage: pyartbuild [art_id]
@@ -326,13 +328,17 @@ def configgetattrib(key: str, attrib: str) -> int:
                         print(f"Invalid animtype keyvalue!")
                 return 0
 
-            # Ugly hack so that I don't have to deal with typing errors from
-            # having an union of int and none be returned by this function
-            if attrib == "correct_pivot_x" or attrib == "correct_pivot_y":
-                return g_config[key][attrib] + 1
             return g_config[key][attrib]
 
     return 0
+
+def configgetattrib2(key: str, attrib: str) -> None | int:
+    "Returns None if attribute isnt set. Doesnt resolve strings"
+    if key in g_config.keys():
+        if attrib in g_config[key].keys():
+            return g_config[key][attrib]
+
+    return None
 
 def build_art(filep: Path):
     "Builds internal representation of final ART file"
@@ -396,11 +402,11 @@ def build_art(filep: Path):
                 animtype = ( configgetattrib(strtilenum, 'animtype') << 6 ) & 0xC0
                 xofs = ( configgetattrib(strtilenum, 'x') << 8 ) & 0xFF00
                 yofs = ( configgetattrib(strtilenum, 'y') << 16 ) & 0xFF0000
-                g_offscorrect_pivot[0] = configgetattrib(strtilenum, 'correct_pivot_x')
-                g_offscorrect_pivot[1] = configgetattrib(strtilenum, 'correct_pivot_y')
+                g_offscorrect_pivot[0] = configgetattrib2(strtilenum, 'correct_pivot_x')
+                g_offscorrect_pivot[1] = configgetattrib2(strtilenum, 'correct_pivot_y')
 
                 if (configgetattrib(strtilenum, 'offscorrect') > 0):
-                    g_offscorrect_remaining = configgetattrib(strtilenum, 'offscorrect')
+                    g_offscorrect_remaining = configgetattrib(strtilenum, 'offscorrect') + 1
                     g_offscorrect_reference_tile = tilenum
                     g_offscorrect_mode = 0
                     g_offscorrect_mode = g_offscorrect_mode | configgetattrib(strtilenum, 'nocorrectx') << 0
@@ -408,16 +414,12 @@ def build_art(filep: Path):
                     g_offscorrect_pivot[2] = g_offscorrect_pivot[0]
                     g_offscorrect_pivot[3] = g_offscorrect_pivot[1]
 
-                if tilenum > g_offscorrect_reference_tile and g_offscorrect_remaining > 0:
+                if g_offscorrect_remaining > 0:
                     prev_xofs = (g_art_picanms[g_offscorrect_reference_tile] & 0xFF00) >> 8
                     prev_yofs = (g_art_picanms[g_offscorrect_reference_tile] & 0xFF0000) >> 16
-                    # Mark zero as None, specifically for passing into correct_offset function
-                    g_offscorrect_pivot = [None if i == 0 else i for i in g_offscorrect_pivot]
-                    # Undo hacky marking that was used to mark this as none
-                    g_offscorrect_pivot = [i - 1 if i != None else i for i in g_offscorrect_pivot]
-
-                    if None in g_offscorrect_pivot[:2] and not None in g_offscorrect_pivot[2:]:
-                        print(f"Warning! Pivot not set for tile {tilenum} belonging to correction offset range of {g_offscorrect_reference_tile}")
+                    if g_offscorrect_reference_tile == tilenum:
+                        prev_xofs = xofs >> 8
+                        prev_yofs = yofs >> 16
 
                     if not g_offscorrect_mode & 1:
                         xofs = (correct_offset(old_size=g_art_tilesizex[g_offscorrect_reference_tile],

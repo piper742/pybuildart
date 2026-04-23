@@ -18,11 +18,16 @@
       devShells.default = pkgs.mkShell {
         packages = with pkgs; [
           pkg-config
+          poetry
           (python313.withPackages (python-pkgs: with python-pkgs; [
           basedpyright
           pillow
           toml
           pip
+          pipx
+          setuptools
+          wheel
+          twine
           ]))
         ];
       };
