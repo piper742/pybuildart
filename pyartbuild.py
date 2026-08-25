@@ -103,7 +103,7 @@ def recalculate_colorspace_lut(lambda_: float) -> None:
     half_lambda: float = lambda_ / 2.0
     SHIFT = 8.0
 
-    print("Recalculating colorspace LUT for: ", lambda_)
+    #print("Recalculating colorspace LUT for: ", lambda_)
 
     # Store as fixed point float (8.8)
     for i in range(NORMALIZED_COLORSPACE_SQUARE+1):
@@ -212,7 +212,7 @@ def write_bytearray(data: list[bytes]) -> None:
         g_export.extend(byte)
     g_export_offset += len(data)
 
-def ImageToBytes(image: Image.Image, dither: bool) -> bytes:
+def ImageToBytes(image: Image.Image, dither: bool, alphacutoff: float) -> bytes:
     global g_palette
     """
     Converts Image to bytes, handles transparency & palettization with optional dithering
@@ -223,7 +223,7 @@ def ImageToBytes(image: Image.Image, dither: bool) -> bytes:
         istransparent = True
 
     if istransparent == True:
-        mask = HandleTransparency(image)
+        mask = HandleTransparency(image, alphacutoff)
         fullytransp = Image.new('L', image.size, color=(0xff))
 
     if image.mode != "RGB":
@@ -448,15 +448,19 @@ def CorrectImageSize(image: Image.Image, lambda_: float) -> Image.Image:
 
     return image2
 
-def HandleTransparency(image: Image.Image) -> Image.Image:
+def HandleTransparency(image: Image.Image, alphacutoff: float) -> Image.Image:
     image2 = image.convert('RGBA')
 
     alpha = image2.split()[-1]
     #alpha = ImageChops.invert(alpha)
 
+    alphacutoff = 2.55 * alphacutoff
+    if alphacutoff > 255.0:
+        alphacutoff = 255
+    intalphacutoff: int = int(alphacutoff)
+
     # Invert alpha & clamp values between 255 and 0
-    # This threshold works perfectly for my horribly rotoscoped foliage
-    alpha = alpha.point(lambda a: 255 if a <= 20 else 0)
+    alpha = alpha.point(lambda a: 255 if a <= intalphacutoff else 0)
 
     return alpha
 
@@ -518,7 +522,9 @@ def print_usage(error: bool) -> None:
        'lambda'          - Lambda value for Rapid, Detail-Preserving Image
                            Downscaling algorithm. Read the paper for more information.
                            Disabled by default, max possible value is 3.3.
-                           Recommended value is 0.5, adjust for desired result.""")
+                           Recommended value is 0.5, adjust for desired result.
+       'alphacut'        - The percentage of transparency at which the image is
+                           considered opaque. Default is 32.""")
 
     if error:
         sys.exit(1)
@@ -684,8 +690,11 @@ def build_art(filep: Path):
 
                     g_offscorrect_remaining -= 1
  
+                # The default value from DEF language's tilefromtexture
+                alpha_cutoff = configgetattrib_float(strtilenum, 'alphacut') if configcheckattrib(strtilenum, 'alphacut') else 32.0
+
                 g_art_picanms[tilenum] = ( animspeed | frames | animtype | xofs | yofs )
-                g_art_tile_data[tilenum] = ImageToBytes(img, dither)
+                g_art_tile_data[tilenum] = ImageToBytes(img, dither, alpha_cutoff)
 
                 if tilenum > g_art_lasttile:
                     g_art_lasttile = tilenum
