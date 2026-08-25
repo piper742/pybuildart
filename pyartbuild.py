@@ -1,6 +1,6 @@
 import math
 import struct, sys
-from PIL import Image, ImageChops, ImageEnhance, ImageFilter
+from PIL import Image, ImageChops, ImageEnhance, ImageFilter, ImageStat, ImageCms
 from io import BufferedReader
 from pathlib import Path
 from array import array
@@ -51,6 +51,10 @@ NORMALIZED_COLORSPACE_SQUARE = 3 * 255 * 255
 # algorithm is meant to be used with
 g_colorspace_lut: array[int] = array('I', [0] * (NORMALIZED_COLORSPACE_SQUARE + 1))
 g_last_lambda: float = -1.0
+
+G_SRGB_PROFILE = ImageCms.createProfile('sRGB')
+G_LAB_PROFILE = ImageCms.createProfile('LAB')
+G_SRGB_TO_LAB_TRANSFORM = ImageCms.buildTransform(G_SRGB_PROFILE, G_LAB_PROFILE, 'RGB', 'LAB')
 
 # Contains the tilesend-tilesstart+1
 g_art_numtiles: int = 256
@@ -212,7 +216,81 @@ def write_bytearray(data: list[bytes]) -> None:
         g_export.extend(byte)
     g_export_offset += len(data)
 
-def ImageToBytes(image: Image.Image, dither: bool, alphacutoff: float) -> bytes:
+def image_lab_dist(image1: Image.Image, image2: Image.Image) -> float:
+    global G_SRGB_TO_LAB_TRANSFORM
+    """
+    Calculates the color distance in LAB between 2 images
+    """
+    # TODO: Can't we initialize transform only once in reinit_globals?
+
+    image1_lab: Image.Image = ImageCms.applyTransform(image1, G_SRGB_TO_LAB_TRANSFORM)
+    image2_lab: Image.Image = ImageCms.applyTransform(image2, G_SRGB_TO_LAB_TRANSFORM)
+
+    image1_data = list(image1_lab.getdata())
+    image2_data = list(image2_lab.getdata())
+
+    total: float = 0.0
+    for one, two in zip(image1_data, image2_data):
+        dL = one[0] - two[0]
+        dA = one[1] - two[1]
+        dB = one[2] - two[2]
+        total += math.sqrt(dL*dL + dA*dA + dB*dB)
+
+    return total / len(image1_data)
+
+def calculate_saturation_range(image: Image.Image, threshold: float) -> tuple[float, float]:
+    """
+    Returns a range that will be used for the saturation search.
+    Threshold controls the complexity of the input image needed to return the
+    restricted range. Raising above 20 is a bad idea unless it's done for only
+    a very few images
+    """
+    greyscale_img: Image.Image = image.convert('L')
+    stat = ImageStat.Stat(greyscale_img)
+    deviation: float = stat.stddev[0]
+
+    # TODO: Update these numbers!
+    if deviation > threshold:
+        return (0.77, 1.2)
+    else:
+        return (0.5, 2.0)
+
+def find_best_saturation(image: Image.Image, tries: int, threshold: float) -> float:
+    """
+    Finds the closest "saturation" or whatever ImageEnhance's Color is doing
+    to the source image based off of the threshold and number of tries
+    """
+    low, high = calculate_saturation_range(image, threshold)
+    img_thumb = image.copy().convert('RGB')
+
+    # TODO: Is this size good enough? It seems to catch the small clusters of
+    # wrongly colored pixels. But if the noise is too much then it fails
+    # Preserve as much color as possible
+    img_thumb.thumbnail((96, 96), Image.Resampling.LANCZOS)
+
+    best_factor = 1.0
+    best_dist = float('inf')
+
+    # Interpolate between high & low
+    factors = [low + (high - low) * i / (tries - 1) for i in range(tries)]
+    for factor in factors:
+        saturated_thumb: Image.Image = ImageEnhance.Color(img_thumb).enhance(factor)
+        # We need to convert this 'P' mode Image to RGB otherwise image_lab_dist will fail spectacularly
+        # HACK HACK - Use FLOYDSTEINBERG dithering to give us a better matching factor since it breaks up
+        # the tiny little errors that cause the "speckles"/mismatched small color spots during palettization
+        quantized_thumb: Image.Image = saturated_thumb.quantize(colors=256,
+                                                                palette=g_palette,
+                                                                dither=Image.Dither.FLOYDSTEINBERG).convert('RGB')
+
+        DIST = image_lab_dist(img_thumb, quantized_thumb)
+        if DIST < best_dist:
+            best_dist = DIST
+            best_factor = factor
+
+    return best_factor
+
+
+def ImageToBytes(image: Image.Image, dither: bool, alphacutoff: float, satcorrect_tries: int, satcorrect_threshold: float) -> bytes:
     global g_palette
     """
     Converts Image to bytes, handles transparency & palettization with optional dithering
@@ -228,6 +306,11 @@ def ImageToBytes(image: Image.Image, dither: bool, alphacutoff: float) -> bytes:
 
     if image.mode != "RGB":
         image = image.convert("RGB")
+
+    if satcorrect_tries > 0:
+        image = ImageEnhance.Color(image).enhance(find_best_saturation(image=image,
+                                                                       threshold=satcorrect_threshold,
+                                                                       tries=satcorrect_tries))
 
     result = image.quantize(colors= 256, method=Image.Quantize.MEDIANCUT, palette=g_palette, dither=Image.Dither.FLOYDSTEINBERG if dither else Image.Dither.NONE)
 
@@ -524,7 +607,13 @@ def print_usage(error: bool) -> None:
                            Disabled by default, max possible value is 3.3.
                            Recommended value is 0.5, adjust for desired result.
        'alphacut'        - The percentage of transparency at which the image is
-                           considered opaque. Default is 32.""")
+                           considered opaque. Default is 32.
+       'satcorrect_tries'- How many times to try and find an optimal saturation
+                           value for palettization. Meant to reduce small wrongly
+                           colored speckles or lines artifacts from palettization.
+                           Default is 0. Recommended is 4, adjust for desired result.
+       'satcorrect_threshold' - Value of image complexity required to restrict the
+                                saturation correction testing range. Default is 10.""")
 
     if error:
         sys.exit(1)
@@ -691,10 +780,15 @@ def build_art(filep: Path):
                     g_offscorrect_remaining -= 1
  
                 # The default value from DEF language's tilefromtexture
-                alpha_cutoff = configgetattrib_float(strtilenum, 'alphacut') if configcheckattrib(strtilenum, 'alphacut') else 32.0
+                alpha_cutoff: float = configgetattrib_float(strtilenum, 'alphacut') if configcheckattrib(strtilenum, 'alphacut') else 32.0
+
+                # Sadly we have to turn this off by default since it breaks highly contrasting tiles (eg. character/actor art)
+                satcorr_tries: int = configgetattrib_int(strtilenum, 'satcorrect_tries') if configcheckattrib(strtilenum, 'satcorrect_tries') else 0
+                satcorr_threshold: float = configgetattrib_float(strtilenum, 'satcorrect_threshold') if configcheckattrib(strtilenum,
+                                                                                                                   'satcorrect_threshold') else 10.0
 
                 g_art_picanms[tilenum] = ( animspeed | frames | animtype | xofs | yofs )
-                g_art_tile_data[tilenum] = ImageToBytes(img, dither, alpha_cutoff)
+                g_art_tile_data[tilenum] = ImageToBytes(img, dither, alpha_cutoff, satcorr_tries, satcorr_threshold)
 
                 if tilenum > g_art_lasttile:
                     g_art_lasttile = tilenum
