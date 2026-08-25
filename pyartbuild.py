@@ -1,5 +1,6 @@
+import math
 import struct, sys
-from PIL import Image, ImageChops
+from PIL import Image, ImageChops, ImageEnhance, ImageFilter
 from io import BufferedReader
 from pathlib import Path
 from array import array
@@ -39,6 +40,18 @@ g_config = dict()
 # 241 color palette (excludes fullbright colors)
 g_palette: Image.Image = Image.Image()
 
+FP16_SHIFT = 16
+FP16_ONE = 1 << FP16_SHIFT
+
+# Normalized colorspace max
+NORMALIZED_COLORSPACE_SQUARE = 3 * 255 * 255
+# We're saving some memory here by utilizing an UINT8
+# This results in the calculation overflowing if lambda > ~3.3 which isn't
+# a problem considering ~3.3 is already outside of the reasonable range this
+# algorithm is meant to be used with
+g_colorspace_lut: array[int] = array('I', [0] * (NORMALIZED_COLORSPACE_SQUARE + 1))
+g_last_lambda: float = -1.0
+
 # Contains the tilesend-tilesstart+1
 g_art_numtiles: int = 256
 # Contains real amount of tiles
@@ -73,6 +86,29 @@ def is_powerof2(n: int) -> bool:
     "Is power of 2. Zero returns true"
     return bool(n & (n-1) == 0)
 
+def fp16_ciel(dividend: int, divisor: int) -> float:
+    """
+    Converts fixed-point back to floating point while also rounding upwards
+    """
+    return (dividend + (divisor - 1)) >> FP16_SHIFT
+
+def recalculate_colorspace_lut(lambda_: float) -> None:
+    """
+    Recalculates color space weight lookup-table based off of lambda.
+    It is fixed point divided as (8.8) to not waste memory
+    """
+    global g_colorspace_lut
+
+    # Avoid square root call
+    half_lambda: float = lambda_ / 2.0
+    SHIFT = 8.0
+
+    print("Recalculating colorspace LUT for: ", lambda_)
+
+    # Store as fixed point float (8.8)
+    for i in range(NORMALIZED_COLORSPACE_SQUARE+1):
+        g_colorspace_lut[i] = int(((i ** half_lambda) * SHIFT + 0.5)) # Do we need this rounding upwards?
+
 def reinit_globals(filep: Path) -> None:
     "Reads in config, and accomodates for ART file size"
     global g_art_numtiles, g_art_tilesend, g_art_tilesstart, g_art_tilesizey, g_art_tilesizex, g_art_picanms, g_art_tile_data
@@ -106,6 +142,10 @@ def reinit_globals(filep: Path) -> None:
     g_art_tilesizey = array('H', [0] * g_art_numtiles)
     g_art_picanms = array('l', [0] * g_art_numtiles)
     g_art_tile_data = [bytes(0)] * g_art_numtiles
+
+    # Do this on-the-fly to not waste startup time, in case
+    # we're not even utilizing RDPD
+    #recalculate_colorspace_lut(g_last_lambda)
 
 def read_config(filep: Path) -> None:
     global g_config
@@ -179,7 +219,7 @@ def ImageToBytes(image: Image.Image, dither: bool) -> bytes:
     """
     istransparent: bool = False
     # Deal with transparency
-    if image.mode in ('RGBA', 'LA') or (image.mode == 'P' and 'transparency' in image.info):
+    if image.has_transparency_data:
         istransparent = True
 
     if istransparent == True:
@@ -198,8 +238,163 @@ def ImageToBytes(image: Image.Image, dither: bool) -> bytes:
 
     return result.tobytes()
 
-def CorrectImageSize(image: Image.Image) -> Image.Image:
+
+def rdpd(input_img: Image.Image, ref_img: Image.Image) -> Image.Image:
+    global g_colorspace_lut
+    """
+    Customized implementation of "Rapid, Detail-Preserving Image Downscaling" by
+    Weber, N., Waechter, M., Amend, S., Guthe, S., Goesele, M. 2016.
+    ACM Trans. Graph. 35, 6, Article 205 (November 2016), 6 pages. DOI = 10.1145/2980179.2980239
+    http://doi.acm.org/10.1145/2980179.2980239.
+
+    This implementation utilizes fixed-point arithmetic and a on-the-fly calculated lookup-table
+    to achieve acceptable performance in Python 3.9+ without the use of NumPy or SciPy.
+    Very primitive alpha channel support is included which clamps the alpha of the reference image
+    to prevent a border around the opaque contents of the image.
+
+    :param input_img Input image
+    :param ref_img Reference image, must be of target size and gaussian blurred,
+    must match the number of channels of the input image
+    """
+    iSizeX, iSizeY = input_img.size
+    oSizeX, oSizeY = ref_img.size
+    # scaling factor expressed in fixed-point
+    scaleX = (iSizeX << FP16_SHIFT) // oSizeX
+    scaleY = (iSizeY << FP16_SHIFT) // oSizeY
+    inPixels = input_img.tobytes()
+    refPixels = ref_img.tobytes()
+    nChannels = 4 if input_img.has_transparency_data else 3
+
+    # Calculate fixed-point fractional overlap mapping table.
+    # Lookup table where each index points to another table,
+    # which contains pixel -> (pixel, fractional overlap) data
+    # Despite what the for loop says, this is calculated for
+    # each pixel of the input image
+    y_overlap: list[list[tuple[int,int]]] = []
+    for pY in range(oSizeY):
+        contribution: list[tuple[int,int]] = []
+        startY: int = max(pY * scaleY, 0)
+        endY: int = (pY + 1) * scaleY
+
+        # "Float" values, converted back from fixed point
+        fStartY: int = startY >> FP16_SHIFT
+        fEndY: int = min(int(fp16_ciel(endY, FP16_ONE)), iSizeY)
+
+        for iY in range(fStartY, fEndY):
+            aStartY = iY << FP16_SHIFT
+            aEndY = (iY + 1) << FP16_SHIFT
+            fracY = (aEndY if aEndY < endY else endY) - \
+                    (aStartY if aStartY > startY else startY)
+            if (fracY > 0):
+                contribution.append((iY, fracY))
+        y_overlap.append(contribution)
+
+    # See above comment
+    x_overlap: list[list[tuple[int,int]]] = []
+    for pX in range(oSizeX):
+        # Fixed point
+        contribution: list[tuple[int,int]] = []
+        startX: int = max(pX * scaleX, 0)
+        endX: int = (pX + 1) * scaleX
+
+        # "Float" values, converted back from fixed point
+        fStartX: int = startX >> FP16_SHIFT
+        fEndX: int = min(int(fp16_ciel(endX, FP16_ONE)), iSizeX)
+
+        for iX in range(fStartX, fEndX):
+            aStartX = iX << FP16_SHIFT
+            aEndX = (iX + 1) << FP16_SHIFT
+            fracX = (aEndX if aEndX < endX else endX) - \
+                    (aStartX if aStartX > startX else startX)
+            if (fracX > 0):
+                contribution.append((iX, fracX))
+        x_overlap.append(contribution)
+
+    # Assume 8 bit RGB
+    # TODO: Grayscale image support?
+    # Zero initialize bytearray
+    oImg: bytearray = bytearray(b'\x00') * oSizeX * oSizeX * nChannels
+
+    for i in range(oSizeX * oSizeY):
+        x: int = i % oSizeX
+        y: int = i // oSizeX
+        sumR: int = 0
+        sumG: int = 0
+        sumB: int = 0
+        normal: int = 0
+
+        x_list: list[tuple[int,int]] = x_overlap[x]
+        y_list: list[tuple[int,int]] = y_overlap[y]
+
+        # output index, output has the same size as reference image
+        oIndex = (x + oSizeX * y) * nChannels
+
+        if nChannels == 4:
+            # This looks fine so far, but this is a pretty ugly
+            # hack to unblur the reference image
+            if refPixels[oIndex + 3] >= 127:
+                oImg[i*nChannels+3] = refPixels[oIndex + 3]
+            else:
+                # Don't process almost empty pixels!
+                continue
+
+        # Access elements like this instead of slicing as that results in a
+        # noticable performance overhead in huge loops like this
+        rR = refPixels[oIndex]
+        rG = refPixels[oIndex+1]
+        rB = refPixels[oIndex+2]
+
+        # Proper fractional scaling using fixed point arithmetic
+        for pY, oY in y_list:
+            row_offset = iSizeX * pY
+            for pX, oX in x_list:
+                # Overlap fraction
+                f = (oX * oY) >> FP16_SHIFT
+                if f == 0:
+                    continue
+
+                # Assume we've got RGB layout
+                # TODO: Grayscale support?
+                iIndex = (pX + row_offset) * nChannels
+
+                # Avoid slicing
+                iR = inPixels[iIndex]
+                iG = inPixels[iIndex+1]
+                iB = inPixels[iIndex+2]
+
+                # Euclidian distance between colors
+                dR = iR - rR
+                dG = iG - rG
+                dB = iB - rB
+                weight = (g_colorspace_lut[(dR*dR+dG*dG+dB*dB)] * f) >> FP16_SHIFT
+                #weight = (colordistance((iR, iG, iB), (rR, rG, rB)) * f) >> FP_SHIFT
+
+                sumR += weight * iR
+                sumG += weight * iG
+                sumB += weight * iB
+                normal += weight
+
+        idx = i * nChannels
+        if normal > 0:
+            oImg[idx] = sumR // normal
+            oImg[1 + idx] = sumG // normal
+            oImg[2 + idx] = sumB // normal
+        else:
+            oImg[idx] = rR
+            oImg[1 + idx] = rG
+            oImg[2 + idx] = rB
+
+
+    if nChannels == 4:
+        return Image.frombytes("RGBA", (oSizeX, oSizeY), bytes(oImg))
+    else:
+        return Image.frombytes("RGB", (oSizeX, oSizeY), bytes(oImg))
+
+def CorrectImageSize(image: Image.Image, lambda_: float) -> Image.Image:
+    global g_last_lambda
     image2 = image
+
+    # Is this actually correct, or does this break the Classic renderer?
     if (image.size[0] * image.size[1]) > MAX_TILE_SIZE_SQUARE:
         width_ratio = MAX_TILE_SIZE / image.size[0]
         height_ratio = MAX_TILE_SIZE / image.size[1]
@@ -215,13 +410,42 @@ def CorrectImageSize(image: Image.Image) -> Image.Image:
         # ever make sprites for actors that break the above rule.
         # Rescale while maintaining aspect ratio
         if new_height % 2 != 0:
-            new_height += 1
-            new_width += 1
+            new_height -= 1
+            new_width -= 1
 
-        if image.format == "JPEG":
+        # TODO: Do we keep this blurry-ish downscaling by default for JPEGs?
+        # It was done based off of the assumption that JPEGs would be high-res
+        # and might have the usual blocky JPEG artifacts
+        # I think this current compromise is good since RDPD preserves more tiny
+        # details and is a bit sharper. It also seems to preform better on grainy
+        # input images
+        if image.format == "JPEG" and lambda_ < 0.0:
             image2 = image.resize((new_width, new_height), Image.Resampling.BILINEAR)
+            return image2
+
+        if lambda_ > 0.0:
+            # Recalculate LUT if needed
+            # I'm assuming whoever is going to be using the RDPD feature
+            # will hopefully group tiles by their lambda
+            if lambda_ != g_last_lambda:
+                recalculate_colorspace_lut(lambda_)
+                g_last_lambda = lambda_
+
+            # Fix wrong colorspace
+            if not image.mode in ('RGB', 'RGBA'):
+                if image.has_transparency_data == True:
+                    image = image.convert('RGBA')
+                else:
+                    image = image.convert('RGB')
+
+            # This should be fast enough
+            refImg = image.resize((new_width, new_height), Image.Resampling.BOX)
+            refImg = refImg.filter(ImageFilter.GaussianBlur(radius=1))
+
+            image2 = rdpd(image, refImg)
         else:
             image2 = image.resize((new_width, new_height), Image.Resampling.NEAREST)
+
     return image2
 
 def HandleTransparency(image: Image.Image) -> Image.Image:
@@ -290,7 +514,11 @@ def print_usage(error: bool) -> None:
        'nocorrecty'      - Prevents overwriting of the specified offset with
                            the corrected value. Must be specified per-tile
                            in the sequence.
-       'dither'          - whether to dither the tile during palettization""")
+       'dither'          - whether to dither the tile during palettization
+       'lambda'          - Lambda value for Rapid, Detail-Preserving Image
+                           Downscaling algorithm. Read the paper for more information.
+                           Disabled by default, max possible value is 3.3.
+                           Recommended value is 0.5, adjust for desired result.""")
 
     if error:
         sys.exit(1)
@@ -369,6 +597,8 @@ def build_art(filep: Path):
                   ) and configgetattrib_int('art', 'start') > 0:
         weirdnumbering = True
 
+    # TODO: This method of sorting is broken!
+    # 205 comes before 50! Needs urgent fixing!
     for f in sorted(filep.iterdir()):
         if has_image_extension(str(f)):
             tilenum = str(f).split(sep='.')[0]
@@ -395,7 +625,13 @@ def build_art(filep: Path):
                 continue
 
             with PILImage(f) as img:
-                img = CorrectImageSize(img)
+                lamb: float = configgetattrib_float(strtilenum, 'lambda') if configcheckattrib(strtilenum, 'lambda') else -1.0
+                if lamb > 3.3:
+                    # TODO: Unify error messages!
+                    print(f"Tile {tilenum}'s 'lambda' value ({lamb}) exceeds the maximum of 3.3! Clamping!")
+                    lamb = 3.3
+
+                img = CorrectImageSize(img, lamb)
                 g_art_tilesizex[tilenum] = img.size[0]
                 g_art_tilesizey[tilenum] = img.size[1]
 
