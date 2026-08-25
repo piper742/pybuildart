@@ -86,15 +86,15 @@ def reinit_globals(filep: Path) -> None:
                 _ = toml.dump(o=DEFAULT_CONFIG, f=f)
         return
 
-    g_art_tilesstart = configgetattrib('art', 'start')
-    g_art_tilesend = g_art_tilesstart + (configgetattrib('art', 'length') - 1)
+    g_art_tilesstart = configgetattrib_int('art', 'start')
+    g_art_tilesend = g_art_tilesstart + (configgetattrib_int('art', 'length') - 1)
     if g_art_tilesstart > g_art_tilesend or g_art_tilesstart == g_art_tilesend:
         print("Invalid ART start & end values!")
         print_usage(error=True)
 
-    if (g_art_tilesstart % configgetattrib('art', 'length')) != 0:
+    if (g_art_tilesstart % configgetattrib_int('art', 'length')) != 0:
         print("WARNING: ART start is not a multiple of length! This could cause issues!")
-    if not is_powerof2(configgetattrib('art', 'length')):
+    if not is_powerof2(configgetattrib_int('art', 'length')):
         print("""
         WARNING: ART length is not power of 2! This will cause issues!
         You have to use a power of 2 value!
@@ -305,7 +305,10 @@ def has_image_extension(filename: str) -> bool:
                         '.j2k', '.jp2', '.dib', '.dds', '.avif', '.qoi', '.fits', '.pcd'}
     return any(filename.endswith(extension) for extension in valid_extensions)
 
-def configgetattrib(key: str, attrib: str) -> int:
+def configgetattrib_int(key: str, attrib: str) -> int:
+    return int(configgetattrib_float(key, attrib))
+
+def configgetattrib_float(key: str, attrib: str) -> float:
     if key in g_config.keys():
         if attrib in g_config[key].keys():
             if isinstance(g_config[key][attrib], str):
@@ -326,19 +329,19 @@ def configgetattrib(key: str, attrib: str) -> int:
                         return 3
                     else:
                         print(f"Invalid animtype keyvalue!")
-                return 0
+                return 0.0
 
-            return g_config[key][attrib]
+            return float(g_config[key][attrib])
 
-    return 0
+    return 0.0
 
-def configgetattrib2(key: str, attrib: str) -> None | int:
-    "Returns None if attribute isnt set. Doesnt resolve strings"
+def configcheckattrib(key: str, attrib: str) -> bool:
+    "Returns whether an attribute is defined"
     if key in g_config.keys():
         if attrib in g_config[key].keys():
-            return g_config[key][attrib]
+            return True
 
-    return None
+    return False
 
 def build_art(filep: Path):
     "Builds internal representation of final ART file"
@@ -363,7 +366,7 @@ def build_art(filep: Path):
     if filep.glob('./[0-9].*',
                   case_sensitive=False,
                   recurse_symlinks=True
-                  ) and configgetattrib('art', 'start') > 0:
+                  ) and configgetattrib_int('art', 'start') > 0:
         weirdnumbering = True
 
     for f in sorted(filep.iterdir()):
@@ -396,21 +399,25 @@ def build_art(filep: Path):
                 g_art_tilesizex[tilenum] = img.size[0]
                 g_art_tilesizey[tilenum] = img.size[1]
 
-                dither = bool(configgetattrib(strtilenum, 'dither'))
-                animspeed = ( configgetattrib(strtilenum, 'speed') << 24 ) & 0xF000000
-                frames = configgetattrib(strtilenum, 'frames') & 0x3F
-                animtype = ( configgetattrib(strtilenum, 'animtype') << 6 ) & 0xC0
-                xofs = ( configgetattrib(strtilenum, 'x') << 8 ) & 0xFF00
-                yofs = ( configgetattrib(strtilenum, 'y') << 16 ) & 0xFF0000
-                g_offscorrect_pivot[0] = configgetattrib2(strtilenum, 'correct_pivot_x')
-                g_offscorrect_pivot[1] = configgetattrib2(strtilenum, 'correct_pivot_y')
+                dither = bool(configgetattrib_int(strtilenum, 'dither'))
+                animspeed = ( configgetattrib_int(strtilenum, 'speed') << 24 ) & 0xF000000
+                frames = configgetattrib_int(strtilenum, 'frames') & 0x3F
+                animtype = ( configgetattrib_int(strtilenum, 'animtype') << 6 ) & 0xC0
+                xofs = ( configgetattrib_int(strtilenum, 'x') << 8 ) & 0xFF00
+                yofs = ( configgetattrib_int(strtilenum, 'y') << 16 ) & 0xFF0000
+                g_offscorrect_pivot[0] = None
+                if configcheckattrib(strtilenum, 'correct_pivot_x'):
+                    g_offscorrect_pivot[0] = configgetattrib_int(strtilenum, 'correct_pivot_x')
+                g_offscorrect_pivot[1] = None
+                if configcheckattrib(strtilenum, 'correct_pivot_y'):
+                    g_offscorrect_pivot[1] = configgetattrib_int(strtilenum, 'correct_pivot_y')
 
-                if (configgetattrib(strtilenum, 'offscorrect') > 0):
-                    g_offscorrect_remaining = configgetattrib(strtilenum, 'offscorrect') + 1
+                if (configgetattrib_int(strtilenum, 'offscorrect') > 0):
+                    g_offscorrect_remaining = configgetattrib_int(strtilenum, 'offscorrect') + 1
                     g_offscorrect_reference_tile = tilenum
                     g_offscorrect_mode = 0
-                    g_offscorrect_mode = g_offscorrect_mode | configgetattrib(strtilenum, 'nocorrectx') << 0
-                    g_offscorrect_mode = g_offscorrect_mode | configgetattrib(strtilenum, 'nocorrecty') << 1
+                    g_offscorrect_mode = g_offscorrect_mode | configgetattrib_int(strtilenum, 'nocorrectx') << 0
+                    g_offscorrect_mode = g_offscorrect_mode | configgetattrib_int(strtilenum, 'nocorrecty') << 1
                     g_offscorrect_pivot[2] = g_offscorrect_pivot[0]
                     g_offscorrect_pivot[3] = g_offscorrect_pivot[1]
 
