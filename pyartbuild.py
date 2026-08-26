@@ -1,5 +1,5 @@
-import math
-import struct, sys
+import struct, sys, re, math
+from typing import Any, Generator
 from PIL import Image, ImageChops, ImageEnhance, ImageFilter, ImageStat, ImageCms
 from io import BufferedReader
 from pathlib import Path
@@ -666,6 +666,16 @@ def configcheckattrib(key: str, attrib: str) -> bool:
 
     return False
 
+def numerical_sort_key(entry: Path):
+    """
+    Splits the filename into chunks of digits and non-digits.
+    Converts digits to integers so "205" comes after "20".
+    """
+    return [
+        int(text) if text.isdigit() else text.lower()
+        for text in re.split(r'(\d+)', entry.name)
+    ]
+
 def build_art(filep: Path):
     "Builds internal representation of final ART file"
     global g_art_tile_data, g_art_tilesizex, g_art_tilesizey, g_art_picanms, g_art_lasttile, g_offscorrect_remaining, g_offscorrect_reference_tile, g_offscorrect_mode, g_offscorrect_pivot
@@ -692,9 +702,8 @@ def build_art(filep: Path):
                   ) and configgetattrib_int('art', 'start') > 0:
         weirdnumbering = True
 
-    # TODO: This method of sorting is broken!
-    # 205 comes before 50! Needs urgent fixing!
-    for f in sorted(filep.iterdir()):
+    # TODO: Could this cause performance issues?
+    for f in sorted(filep.iterdir(), key=numerical_sort_key):
         if has_image_extension(str(f)):
             tilenum = str(f).split(sep='.')[0]
             tilenum = tilenum.split(sep='/')[1]
