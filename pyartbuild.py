@@ -263,6 +263,9 @@ def find_best_saturation(image: Image.Image, tries: int, threshold: float) -> fl
     low, high = calculate_saturation_range(image, threshold)
     img_thumb = image.copy().convert('RGB')
 
+    # We can't have only a single try, as that results in a divide by zero
+    tries += 1
+
     # TODO: Is this size good enough? It seems to catch the small clusters of
     # wrongly colored pixels. But if the noise is too much then it fails
     # Preserve as much color as possible
