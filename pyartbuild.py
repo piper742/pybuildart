@@ -1,5 +1,5 @@
+from collections.abc import Generator
 import struct, sys, re, math
-from typing import Any, Generator
 from PIL import Image, ImageChops, ImageEnhance, ImageFilter, ImageStat, ImageCms
 from io import BufferedReader
 from pathlib import Path
@@ -31,11 +31,17 @@ C_UCHAR3_LEN = struct.calcsize(C_UCHAR3)
 C_UCHAR3_UNPACK = struct.Struct(C_UCHAR3).unpack_from
 
 # TOML config
-# the sets aren't used anywhere, reference only
-ART_CONFIG_OPTIONS: set[str] = { 'numtiles', 'starttile' }
-TILE_CONFIG_OPTIONS: set[str] = { 'x', 'y', 'frames', 'animtype', 'speed', 'dither', 'offscorrect', 'nocorrectx', 'nocorrecty', 'correct_pivot_x', 'correct_pivot_y' }
-DEFAULT_CONFIG: dict[str, dict[str, int]] = {'art': {'start': 0, 'length': 256}}
+# this set isn't used anywhere, reference only
+TILE_CONFIG_OPTIONS: set[str] = { 'x', 'y', 'frames', 'animtype', 'speed', 'dither', 'offscorrect', 'nocorrectx', 'nocorrecty', 'correct_pivot_x', 'correct_pivot_y', 'lambda', 'alphacut', 'satcorrect_tries', 'satcorrect_threshold' }
+
+# hardcode global keys here!!!
+ART_CONFIG_OPTIONS: set[str] = { 'start', 'length' }
+# Config to create if one isn't present
+DEFAULT_CONFIG: dict[str, str | int | float] = {'start': 0, 'length': 256}
+# Config which applies globally to the entire resulting ART file
 g_config = dict()
+# Per-tile config dict lookup table
+g_config_lut = []
 
 # 241 color palette (excludes fullbright colors)
 g_palette: Image.Image = Image.Image()
@@ -126,15 +132,15 @@ def reinit_globals(filep: Path) -> None:
                 _ = toml.dump(o=DEFAULT_CONFIG, f=f)
         return
 
-    g_art_tilesstart = configgetattrib_int('art', 'start')
-    g_art_tilesend = g_art_tilesstart + (configgetattrib_int('art', 'length') - 1)
+    g_art_tilesstart = gconfigattrib_int('start')
+    g_art_tilesend = g_art_tilesstart + (gconfigattrib_int('length') - 1)
     if g_art_tilesstart > g_art_tilesend or g_art_tilesstart == g_art_tilesend:
         print("Invalid ART start & end values!")
         print_usage(error=True)
 
-    if (g_art_tilesstart % configgetattrib_int('art', 'length')) != 0:
+    if (g_art_tilesstart % gconfigattrib_int('length')) != 0:
         print("WARNING: ART start is not a multiple of length! This could cause issues!")
-    if not is_powerof2(configgetattrib_int('art', 'length')):
+    if not is_powerof2(gconfigattrib_int('length')):
         print("""
         WARNING: ART length is not power of 2! This will cause issues!
         You have to use a power of 2 value!
@@ -151,11 +157,67 @@ def reinit_globals(filep: Path) -> None:
     # we're not even utilizing RDPD
     #recalculate_colorspace_lut(g_last_lambda)
 
+def handle_config_keys(key: str) -> Generator[tuple[int, bool]]:
+    """
+    Takes the config dict's key (the tilenum) as input and returns all
+    affected tile numbers and whether they are part of a ranged decleration.
+    Handles comma seperated and ranged tile declerations.
+    """
+    parts = key.split(',')
+    for part in parts:
+        part = part.strip()
+        if '-' in part:
+            range_start, range_end = part.split('-')
+            range_start = int(range_start.strip())
+            range_end = int(range_end.strip())
+            if range_start > range_end:
+                range_start, range_end = range_end, range_start
+            for tilenum in range(range_start, range_end + 1):
+                yield tilenum, True
+        else:
+            yield int(part), False
+
+
+def merge_config_dicts(current, new, no_override: bool):
+    """
+    Merges two dicts, returns new if current is None.
+    If no_override is true, values from current are kept.
+    """
+    if current is None:
+        return new.copy()
+
+    new2 = new.copy()
+    if no_override:
+        for key in current.keys():
+            del new2[key]
+
+    merged = current.copy()
+    merged.update(new2)
+    return merged
+
+
 def read_config(filep: Path) -> None:
-    global g_config
+    global g_config_lut, g_config
     try:
         with open(filep, "r") as f:
-            g_config = toml.load(f)
+            config = toml.load(f)
+            for key, val in config.items():
+                # This sucks, but is still better speed wise than regex
+                if key in ART_CONFIG_OPTIONS:
+                    g_config[key] = val
+                    # Ugly place to initialize this, but whatever
+                    # length must be declared in config before any tiles are!
+                    if key == 'length':
+                        g_config_lut = [None] * (int(val) + 1)
+                    continue
+
+                for tilenum, is_ranged in handle_config_keys(key):
+                    g_config_lut[tilenum] = merge_config_dicts(current=g_config_lut[tilenum],
+                                                               new=val,
+                                                               no_override=is_ranged)
+
+            # DEBUG
+            # print(g_config_lut)
     except Exception as error:
         print(f"Couldn't find/parse config file: {filep}")
         print(error)
@@ -631,14 +693,19 @@ def has_image_extension(filename: str) -> bool:
                         '.j2k', '.jp2', '.dib', '.dds', '.avif', '.qoi', '.fits', '.pcd'}
     return any(filename.endswith(extension) for extension in valid_extensions)
 
-def configgetattrib_int(key: str, attrib: str) -> int:
-    return int(configgetattrib_float(key, attrib))
+def gconfigattrib_int(attrib: str) -> int:
+    if attrib in g_config.keys():
+        return int(g_config.get(attrib, 0))
+    return 0
 
-def configgetattrib_float(key: str, attrib: str) -> float:
-    if key in g_config.keys():
-        if attrib in g_config[key].keys():
-            if isinstance(g_config[key][attrib], str):
-                s_attrib = str(g_config[key][attrib]).lower()
+def configgetattrib_int(tilenum: int, attrib: str) -> int:
+    return int(configgetattrib_float(tilenum, attrib))
+
+def configgetattrib_float(tilenum: int, attrib: str) -> float:
+    if not g_config_lut[tilenum] is None:
+        if attrib in g_config_lut[tilenum].keys():
+            if isinstance(g_config_lut[tilenum][attrib], str):
+                s_attrib = str(g_config_lut[tilenum][attrib]).lower()
                 if attrib == 'dither' or attrib == 'nocorrectx' or attrib == 'nocorrecty':
                     if s_attrib == "true":
                         return 1
@@ -657,14 +724,15 @@ def configgetattrib_float(key: str, attrib: str) -> float:
                         print(f"Invalid animtype keyvalue!")
                 return 0.0
 
-            return float(g_config[key][attrib])
+            return float(g_config_lut[tilenum][attrib])
 
     return 0.0
 
-def configcheckattrib(key: str, attrib: str) -> bool:
+def configcheckattrib(tilenum: int, attrib: str) -> bool:
     "Returns whether an attribute is defined"
-    if key in g_config.keys():
-        if attrib in g_config[key].keys():
+    #if key in g_config_lut.keys():
+    if not g_config_lut[tilenum] is None:
+        if attrib in g_config_lut[tilenum].keys():
             return True
 
     return False
@@ -702,7 +770,7 @@ def build_art(filep: Path):
     if filep.glob('./[0-9].*',
                   case_sensitive=False,
                   recurse_symlinks=True
-                  ) and configgetattrib_int('art', 'start') > 0:
+                  ) and gconfigattrib_int('start') > 0:
         weirdnumbering = True
 
     # TODO: Could this cause performance issues?
@@ -732,7 +800,7 @@ def build_art(filep: Path):
                 continue
 
             with PILImage(f) as img:
-                lamb: float = configgetattrib_float(strtilenum, 'lambda') if configcheckattrib(strtilenum, 'lambda') else -1.0
+                lamb: float = configgetattrib_float(tilenum, 'lambda') if configcheckattrib(tilenum, 'lambda') else -1.0
                 if lamb > 3.3:
                     # TODO: Unify error messages!
                     print(f"Tile {tilenum}'s 'lambda' value ({lamb}) exceeds the maximum of 3.3! Clamping!")
@@ -742,25 +810,25 @@ def build_art(filep: Path):
                 g_art_tilesizex[tilenum] = img.size[0]
                 g_art_tilesizey[tilenum] = img.size[1]
 
-                dither = bool(configgetattrib_int(strtilenum, 'dither'))
-                animspeed = ( configgetattrib_int(strtilenum, 'speed') << 24 ) & 0xF000000
-                frames = configgetattrib_int(strtilenum, 'frames') & 0x3F
-                animtype = ( configgetattrib_int(strtilenum, 'animtype') << 6 ) & 0xC0
-                xofs = ( configgetattrib_int(strtilenum, 'x') << 8 ) & 0xFF00
-                yofs = ( configgetattrib_int(strtilenum, 'y') << 16 ) & 0xFF0000
+                dither = bool(configgetattrib_int(tilenum, 'dither'))
+                animspeed = ( configgetattrib_int(tilenum, 'speed') << 24 ) & 0xF000000
+                frames = configgetattrib_int(tilenum, 'frames') & 0x3F
+                animtype = ( configgetattrib_int(tilenum, 'animtype') << 6 ) & 0xC0
+                xofs = ( configgetattrib_int(tilenum, 'x') << 8 ) & 0xFF00
+                yofs = ( configgetattrib_int(tilenum, 'y') << 16 ) & 0xFF0000
                 g_offscorrect_pivot[0] = None
-                if configcheckattrib(strtilenum, 'correct_pivot_x'):
-                    g_offscorrect_pivot[0] = configgetattrib_int(strtilenum, 'correct_pivot_x')
+                if configcheckattrib(tilenum, 'correct_pivot_x'):
+                    g_offscorrect_pivot[0] = configgetattrib_int(tilenum, 'correct_pivot_x')
                 g_offscorrect_pivot[1] = None
-                if configcheckattrib(strtilenum, 'correct_pivot_y'):
-                    g_offscorrect_pivot[1] = configgetattrib_int(strtilenum, 'correct_pivot_y')
+                if configcheckattrib(tilenum, 'correct_pivot_y'):
+                    g_offscorrect_pivot[1] = configgetattrib_int(tilenum, 'correct_pivot_y')
 
-                if (configgetattrib_int(strtilenum, 'offscorrect') > 0):
-                    g_offscorrect_remaining = configgetattrib_int(strtilenum, 'offscorrect') + 1
+                if (configgetattrib_int(tilenum, 'offscorrect') > 0):
+                    g_offscorrect_remaining = configgetattrib_int(tilenum, 'offscorrect') + 1
                     g_offscorrect_reference_tile = tilenum
                     g_offscorrect_mode = 0
-                    g_offscorrect_mode = g_offscorrect_mode | configgetattrib_int(strtilenum, 'nocorrectx') << 0
-                    g_offscorrect_mode = g_offscorrect_mode | configgetattrib_int(strtilenum, 'nocorrecty') << 1
+                    g_offscorrect_mode = g_offscorrect_mode | configgetattrib_int(tilenum, 'nocorrectx') << 0
+                    g_offscorrect_mode = g_offscorrect_mode | configgetattrib_int(tilenum, 'nocorrecty') << 1
                     g_offscorrect_pivot[2] = g_offscorrect_pivot[0]
                     g_offscorrect_pivot[3] = g_offscorrect_pivot[1]
 
@@ -792,11 +860,11 @@ def build_art(filep: Path):
                     g_offscorrect_remaining -= 1
  
                 # The default value from DEF language's tilefromtexture
-                alpha_cutoff: float = configgetattrib_float(strtilenum, 'alphacut') if configcheckattrib(strtilenum, 'alphacut') else 32.0
+                alpha_cutoff: float = configgetattrib_float(tilenum, 'alphacut') if configcheckattrib(tilenum, 'alphacut') else 32.0
 
                 # Sadly we have to turn this off by default since it breaks highly contrasting tiles (eg. character/actor art)
-                satcorr_tries: int = configgetattrib_int(strtilenum, 'satcorrect_tries') if configcheckattrib(strtilenum, 'satcorrect_tries') else 0
-                satcorr_threshold: float = configgetattrib_float(strtilenum, 'satcorrect_threshold') if configcheckattrib(strtilenum,
+                satcorr_tries: int = configgetattrib_int(tilenum, 'satcorrect_tries') if configcheckattrib(tilenum, 'satcorrect_tries') else 0
+                satcorr_threshold: float = configgetattrib_float(tilenum, 'satcorrect_threshold') if configcheckattrib(tilenum,
                                                                                                                    'satcorrect_threshold') else 10.0
 
                 g_art_picanms[tilenum] = ( animspeed | frames | animtype | xofs | yofs )
