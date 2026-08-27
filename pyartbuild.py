@@ -760,6 +760,11 @@ def process_animated_tile(tilenum: int, img: Image.Image) -> None:
         if img.info.get("default_image", False) == True:
             frames_remaining -= 1
             curTile -= 1
+
+    if frames_remaining > 63:
+        print(f"WARNING: Animated tile {startTile} has more frames than BUILD can support! Clamping to 64.")
+        frames_remaining = 63
+
     initial_framecount = frames_remaining
 
     # We didn't apply the APNG default image discard
@@ -772,9 +777,10 @@ def process_animated_tile(tilenum: int, img: Image.Image) -> None:
         tileBit = (1 << curTile)
         safe: bool = bool((g_defined_tiles_bm & tileBit) ^ tileBit)
         if safe and curTile < g_art_numtiles:
-            process_tile(curTile, frame)
+            if frames_remaining >= 0:
+                process_tile(curTile, frame)
 
-            frames_remaining -= 1
+                frames_remaining -= 1
         else:
             print(f"ERROR: Not enough space for animated sequence starting at: {startTile}. Ran out of space at: {curTile}")
             g_config_lut[startTile]['frames'] = initial_framecount - frames_remaining
