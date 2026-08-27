@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 from collections.abc import Generator
 import struct, sys, re, math
 from PIL import Image, ImageChops, ImageEnhance, ImageFilter, ImageStat, ImageCms, ImageSequence
