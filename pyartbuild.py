@@ -1,6 +1,6 @@
 from collections.abc import Generator
 import struct, sys, re, math
-from PIL import Image, ImageChops, ImageEnhance, ImageFilter, ImageStat, ImageCms
+from PIL import Image, ImageChops, ImageEnhance, ImageFilter, ImageStat, ImageCms, ImageSequence
 from io import BufferedReader
 from pathlib import Path
 from array import array
@@ -81,8 +81,11 @@ g_offscorrect_reference_tile: int = 0
 g_offscorrect_mode: int = 0
 g_offscorrect_pivot: list[ int | None ] = [None] * 4
 
+# Meant for the future delta-patching functionality
+# to speed up huge ART file builds
 # Not used anywhere, but should still be valid
 g_export_offset: int = 0
+g_defined_tiles_bm: int = 0
 
 @contextmanager
 def PILImage(filep: Path):
@@ -690,7 +693,8 @@ def has_image_extension(filename: str) -> bool:
     valid_extensions = {'.png', '.bmp', '.jpg', '.jpeg', '.tiff', '.j2p', '.jpx', '.jfif',
                         '.pcx', '.ppm', '.pgm', '.pbm', '.webp', '.xbm', '.dcx', '.ico',
                         '.icns', '.imt', '.pcd', '.psd', '.tga', '.xpm', '.im', '.eps',
-                        '.j2k', '.jp2', '.dib', '.dds', '.avif', '.qoi', '.fits', '.pcd'}
+                        '.j2k', '.jp2', '.dib', '.dds', '.avif', '.qoi', '.fits', '.pcd',
+                        '.gif', '.apng'}
     return any(filename.endswith(extension) for extension in valid_extensions)
 
 def gconfigattrib_int(attrib: str) -> int:
@@ -737,6 +741,121 @@ def configcheckattrib(tilenum: int, attrib: str) -> bool:
 
     return False
 
+def process_animated_tile(tilenum: int, img: Image.Image) -> None:
+    """
+    Processes a tile that is the start of an animation sequence.
+    Input image must be of animated type so that all the member variables are present
+    """
+    startTile: int = tilenum
+    curTile: int = tilenum
+    frames_remaining:int = img.n_frames
+
+    if g_config_lut[startTile] is None:
+        g_config_lut[startTile] = {}
+    g_config_lut[startTile]['frames'] = frames_remaining
+    g_config_lut[startTile]['animtype'] = "fd"
+
+    # Discard default image, since most of the time it's the thumbnail
+    if "default_image" in img.info:
+        if img.info.get("default_image", False) == True:
+            frames_remaining -= 1
+            curTile -= 1
+    initial_framecount = frames_remaining
+
+    # We didn't apply the APNG default image discard
+    if curTile == startTile:
+        process_tile(startTile, img)
+
+    print(curTile, frames_remaining)
+    for frame in ImageSequence.Iterator(img):
+        curTile += 1
+        tileBit = (1 << curTile)
+        safe: bool = bool((g_defined_tiles_bm & tileBit) ^ tileBit)
+        if safe and curTile < g_art_numtiles:
+            process_tile(curTile, frame)
+
+            frames_remaining -= 1
+        else:
+            print(f"ERROR: Not enough space for animated sequence starting at: {startTile}. Ran out of space at: {curTile}")
+            g_config_lut[startTile]['frames'] = initial_framecount - frames_remaining
+            process_tile(startTile, img)
+            return
+
+def process_tile(tilenum: int, img: Image.Image) -> None:
+    """
+    Processes a single tile
+    """
+    global g_art_lasttile, g_offscorrect_remaining, g_offscorrect_reference_tile, g_offscorrect_mode, g_offscorrect_pivot, g_art_tilesizex, g_art_tilesizey, g_art_picanms, g_art_tile_data
+
+    lamb: float = configgetattrib_float(tilenum, 'lambda') if configcheckattrib(tilenum, 'lambda') else -1.0
+    if lamb > 3.3:
+        # TODO: Unify error messages!
+        print(f"Tile {tilenum}'s 'lambda' value ({lamb}) exceeds the maximum of 3.3! Clamping!")
+        lamb = 3.3
+
+    img = CorrectImageSize(img, lamb)
+    g_art_tilesizex[tilenum] = img.size[0]
+    g_art_tilesizey[tilenum] = img.size[1]
+
+    dither: bool = bool(configgetattrib_int(tilenum, 'dither'))
+    animspeed = ( configgetattrib_int(tilenum, 'speed') << 24 ) & 0xF000000
+    frames = configgetattrib_int(tilenum, 'frames') & 0x3F
+    animtype = ( configgetattrib_int(tilenum, 'animtype') << 6 ) & 0xC0
+    xofs = ( configgetattrib_int(tilenum, 'x') << 8 ) & 0xFF00
+    yofs = ( configgetattrib_int(tilenum, 'y') << 16 ) & 0xFF0000
+    g_offscorrect_pivot[0] = None
+    if configcheckattrib(tilenum, 'correct_pivot_x'):
+        g_offscorrect_pivot[0] = configgetattrib_int(tilenum, 'correct_pivot_x')
+    g_offscorrect_pivot[1] = None
+    if configcheckattrib(tilenum, 'correct_pivot_y'):
+        g_offscorrect_pivot[1] = configgetattrib_int(tilenum, 'correct_pivot_y')
+
+    if (configgetattrib_int(tilenum, 'offscorrect') > 0):
+        g_offscorrect_remaining = configgetattrib_int(tilenum, 'offscorrect') + 1
+        g_offscorrect_reference_tile = tilenum
+        g_offscorrect_mode = 0
+        g_offscorrect_mode = g_offscorrect_mode | configgetattrib_int(tilenum, 'nocorrectx') << 0
+        g_offscorrect_mode = g_offscorrect_mode | configgetattrib_int(tilenum, 'nocorrecty') << 1
+        g_offscorrect_pivot[2] = g_offscorrect_pivot[0]
+        g_offscorrect_pivot[3] = g_offscorrect_pivot[1]
+
+    if g_offscorrect_remaining > 0:
+        prev_xofs = (g_art_picanms[g_offscorrect_reference_tile] & 0xFF00) >> 8
+        prev_yofs = (g_art_picanms[g_offscorrect_reference_tile] & 0xFF0000) >> 16
+        if g_offscorrect_reference_tile == tilenum:
+            prev_xofs = xofs >> 8
+            prev_yofs = yofs >> 16
+
+        if not g_offscorrect_mode & 1:
+            xofs = (correct_offset(old_size=g_art_tilesizex[g_offscorrect_reference_tile],
+                                 new_size=g_art_tilesizex[tilenum],
+                                 old_offset=prev_xofs,
+                                 old_pivot=g_offscorrect_pivot[2],
+                                 new_pivot=g_offscorrect_pivot[0]) << 8) & 0xFF00
+
+        if not g_offscorrect_mode & 2:
+            yofs = (correct_offset(old_size=g_art_tilesizey[g_offscorrect_reference_tile],
+                                 new_size=g_art_tilesizey[tilenum],
+                                 old_offset=prev_yofs,
+                                 old_pivot=g_offscorrect_pivot[3],
+                                 new_pivot=g_offscorrect_pivot[1]) << 16) & 0xFF0000
+
+        g_offscorrect_remaining -= 1
+
+    # The default value from DEF language's tilefromtexture
+    alpha_cutoff: float = configgetattrib_float(tilenum, 'alphacut') if configcheckattrib(tilenum, 'alphacut') else 32.0
+
+    # Sadly we have to turn this off by default since it breaks highly contrasting tiles (eg. character/actor art)
+    satcorr_tries: int = configgetattrib_int(tilenum, 'satcorrect_tries') if configcheckattrib(tilenum, 'satcorrect_tries') else 0
+    satcorr_threshold: float = configgetattrib_float(tilenum, 'satcorrect_threshold') if configcheckattrib(tilenum,
+                                                                                                       'satcorrect_threshold') else 10.0
+
+    g_art_picanms[tilenum] = ( animspeed | frames | animtype | xofs | yofs )
+    g_art_tile_data[tilenum] = ImageToBytes(img, dither, alpha_cutoff, satcorr_tries, satcorr_threshold)
+
+    if tilenum > g_art_lasttile:
+        g_art_lasttile = tilenum
+
 def numerical_sort_key(entry: Path):
     """
     Splits the filename into chunks of digits and non-digits.
@@ -748,8 +867,9 @@ def numerical_sort_key(entry: Path):
     ]
 
 def build_art(filep: Path):
+    global g_defined_tiles_bm
     "Builds internal representation of final ART file"
-    global g_art_tile_data, g_art_tilesizex, g_art_tilesizey, g_art_picanms, g_art_lasttile, g_offscorrect_remaining, g_offscorrect_reference_tile, g_offscorrect_mode, g_offscorrect_pivot
+    
     weirdnumbering: bool = False
     # Number of tiles above end of artfile
     overflow: int = 0
@@ -773,6 +893,13 @@ def build_art(filep: Path):
                   ) and gconfigattrib_int('start') > 0:
         weirdnumbering = True
 
+    # Let's hope 2 iterations don't slow this down too much...
+    for f in sorted(filep.iterdir(), key=numerical_sort_key):
+        if has_image_extension(str(f)):
+            tilenum = str(f).split(sep='.')[0]
+            tilenum = tilenum.split(sep='/')[1]
+            g_defined_tiles_bm |= 1 << int(tilenum)
+
     # TODO: Could this cause performance issues?
     for f in sorted(filep.iterdir(), key=numerical_sort_key):
         if has_image_extension(str(f)):
@@ -784,11 +911,7 @@ def build_art(filep: Path):
                 print("Error wrongly named file!")
                 print_usage(True)
             
-            dither: bool = False
             tilenum = int(tilenum)
-
-            # Keep weird numbering to match the config
-            strtilenum = str(tilenum)
 
             if weirdnumbering:
                tilenum -= g_art_tilesstart 
@@ -800,78 +923,15 @@ def build_art(filep: Path):
                 continue
 
             with PILImage(f) as img:
-                lamb: float = configgetattrib_float(tilenum, 'lambda') if configcheckattrib(tilenum, 'lambda') else -1.0
-                if lamb > 3.3:
-                    # TODO: Unify error messages!
-                    print(f"Tile {tilenum}'s 'lambda' value ({lamb}) exceeds the maximum of 3.3! Clamping!")
-                    lamb = 3.3
+                isAnimated: bool = False
+                if img.format and img.format.upper() in ['AVIF', 'PNG', 'APNG', 'GIF', 'TIFF', 'WEBP']:
+                    if img.is_animated:
+                        isAnimated = True
 
-                img = CorrectImageSize(img, lamb)
-                g_art_tilesizex[tilenum] = img.size[0]
-                g_art_tilesizey[tilenum] = img.size[1]
-
-                dither = bool(configgetattrib_int(tilenum, 'dither'))
-                animspeed = ( configgetattrib_int(tilenum, 'speed') << 24 ) & 0xF000000
-                frames = configgetattrib_int(tilenum, 'frames') & 0x3F
-                animtype = ( configgetattrib_int(tilenum, 'animtype') << 6 ) & 0xC0
-                xofs = ( configgetattrib_int(tilenum, 'x') << 8 ) & 0xFF00
-                yofs = ( configgetattrib_int(tilenum, 'y') << 16 ) & 0xFF0000
-                g_offscorrect_pivot[0] = None
-                if configcheckattrib(tilenum, 'correct_pivot_x'):
-                    g_offscorrect_pivot[0] = configgetattrib_int(tilenum, 'correct_pivot_x')
-                g_offscorrect_pivot[1] = None
-                if configcheckattrib(tilenum, 'correct_pivot_y'):
-                    g_offscorrect_pivot[1] = configgetattrib_int(tilenum, 'correct_pivot_y')
-
-                if (configgetattrib_int(tilenum, 'offscorrect') > 0):
-                    g_offscorrect_remaining = configgetattrib_int(tilenum, 'offscorrect') + 1
-                    g_offscorrect_reference_tile = tilenum
-                    g_offscorrect_mode = 0
-                    g_offscorrect_mode = g_offscorrect_mode | configgetattrib_int(tilenum, 'nocorrectx') << 0
-                    g_offscorrect_mode = g_offscorrect_mode | configgetattrib_int(tilenum, 'nocorrecty') << 1
-                    g_offscorrect_pivot[2] = g_offscorrect_pivot[0]
-                    g_offscorrect_pivot[3] = g_offscorrect_pivot[1]
-
-                if g_offscorrect_remaining > 0:
-                    prev_xofs = (g_art_picanms[g_offscorrect_reference_tile] & 0xFF00) >> 8
-                    prev_yofs = (g_art_picanms[g_offscorrect_reference_tile] & 0xFF0000) >> 16
-                    if g_offscorrect_reference_tile == tilenum:
-                        prev_xofs = xofs >> 8
-                        prev_yofs = yofs >> 16
-
-                    if not g_offscorrect_mode & 1:
-                        xofs = (correct_offset(old_size=g_art_tilesizex[g_offscorrect_reference_tile],
-                                             new_size=g_art_tilesizex[tilenum],
-                                             old_offset=prev_xofs,
-                                             old_pivot=g_offscorrect_pivot[2],
-                                             new_pivot=g_offscorrect_pivot[0]) << 8) & 0xFF00
-                    #else:
-                    #    xofs = prev_xofs << 8
-
-                    if not g_offscorrect_mode & 2:
-                        yofs = (correct_offset(old_size=g_art_tilesizey[g_offscorrect_reference_tile],
-                                             new_size=g_art_tilesizey[tilenum],
-                                             old_offset=prev_yofs,
-                                             old_pivot=g_offscorrect_pivot[3],
-                                             new_pivot=g_offscorrect_pivot[1]) << 16) & 0xFF0000
-                    #else:
-                    #    yofs = prev_yofs << 16
-
-                    g_offscorrect_remaining -= 1
- 
-                # The default value from DEF language's tilefromtexture
-                alpha_cutoff: float = configgetattrib_float(tilenum, 'alphacut') if configcheckattrib(tilenum, 'alphacut') else 32.0
-
-                # Sadly we have to turn this off by default since it breaks highly contrasting tiles (eg. character/actor art)
-                satcorr_tries: int = configgetattrib_int(tilenum, 'satcorrect_tries') if configcheckattrib(tilenum, 'satcorrect_tries') else 0
-                satcorr_threshold: float = configgetattrib_float(tilenum, 'satcorrect_threshold') if configcheckattrib(tilenum,
-                                                                                                                   'satcorrect_threshold') else 10.0
-
-                g_art_picanms[tilenum] = ( animspeed | frames | animtype | xofs | yofs )
-                g_art_tile_data[tilenum] = ImageToBytes(img, dither, alpha_cutoff, satcorr_tries, satcorr_threshold)
-
-                if tilenum > g_art_lasttile:
-                    g_art_lasttile = tilenum
+                if isAnimated:
+                    process_animated_tile(tilenum, img)
+                else:
+                    process_tile(tilenum, img)
 
     if overflow > 3:
         overflow -= 3
