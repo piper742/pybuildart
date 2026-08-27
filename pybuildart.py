@@ -43,8 +43,10 @@ g_config = dict()
 # Per-tile config dict lookup table
 g_config_lut = []
 
-# 241 color palette (excludes fullbright colors)
+# 240 color palette (excludes fullbright colors)
 g_palette: Image.Image = Image.Image()
+MAX_PAL_COLORS = 240
+MAX_PAL_COLORS_RGB = MAX_PAL_COLORS * 3
 
 FP16_SHIFT = 16
 FP16_ONE = 1 << FP16_SHIFT
@@ -226,12 +228,12 @@ def read_config(filep: Path) -> None:
         print(error)
         raise Exception('Hack cuz Im lazy')
 
-def read_palette(filep: Path):
+def read_palette_dat(filep: Path):
     global g_palette
     tmp: list[int] = []
     try:
         with open(filep, "rb") as f:
-            for _ in range(240):
+            for _ in range(MAX_PAL_COLORS):
                 rgb = read_3_unsigned_chars(f)
                 
                 # Undo a DOS optimization by multiplying the palette values by 4
@@ -241,7 +243,38 @@ def read_palette(filep: Path):
         g_palette.putpalette(tmp)
     except Exception as error:
         print("Failed to read PALETTE.DAT")
-        print("Error: ", error)
+        print("Error:", error)
+        sys.exit(65)
+
+def read_palette_png(filep: Path) -> None:
+    global g_palette
+
+    try:
+        with PILImage(filep) as img:
+            img = img.convert('RGB')
+            width, height = img.size
+
+            if (width * height) >= MAX_PAL_COLORS:
+                tmp: list[int] = []
+                pixels = img.load()
+
+                # Warn the user about this
+                # Though it's probably a redundant warning, considering they're
+                # using basepalette already and have most likely read the wiki.
+                if (width * height) < 256:
+                    print(f"WARNING: {filep} palette won't be loaded by EDuke32. It's dimensions when multiplied must be 256.")
+
+                for y in range(height):
+                    for x in range(width):
+                        tmp.extend(pixels[x, y])
+                pal = tmp[:MAX_PAL_COLORS_RGB]
+                g_palette = Image.new('P', (16, 15))
+                g_palette.putpalette(pal)
+            else:
+                raise Exception("Not enought colors! Must have at least 240 color palette.")
+    except Exception as error:
+        print(f"Failed to read {filep}")
+        print("Error:", error)
         sys.exit(65)
 
 def read_short(file: BufferedReader) -> int:
@@ -635,8 +668,8 @@ def print_usage(error: bool) -> None:
        art_id=DIRECTORY
                 A directory which is named 3 digits which corresponds
                 to the resulting tiles###.art file's number.
-       In the working directory a PALETTE.DAT file is required. A RAW
-       256 color RGB palette will also work. The last 16 fullbright
+       In the working directory a PALETTE.DAT file is required. A PNG
+       240-256 color RGB palette will also work. The last 16 fullbright
        colors are omitted during palettization.
        The directory containing the input images needs to have a
        config.toml file, which gets generated on first use.
@@ -761,9 +794,9 @@ def process_animated_tile(tilenum: int, img: Image.Image) -> None:
             frames_remaining -= 1
             curTile -= 1
 
-    if frames_remaining > 63:
-        print(f"WARNING: Animated tile {startTile} has more frames than BUILD can support! Clamping to 64.")
-        frames_remaining = 63
+    if frames_remaining > 62:
+        print(f"WARNING: Animated tile {startTile} has more frames than BUILD can support! Clamping to 63.")
+        frames_remaining = 62
 
     initial_framecount = frames_remaining
 
@@ -771,7 +804,7 @@ def process_animated_tile(tilenum: int, img: Image.Image) -> None:
     if curTile == startTile:
         process_tile(startTile, img)
 
-    print(curTile, frames_remaining)
+    #print(curTile, frames_remaining)
     for frame in ImageSequence.Iterator(img):
         curTile += 1
         tileBit = (1 << curTile)
@@ -975,10 +1008,18 @@ def main() -> None:
         print_usage(False)
 
     workdir = Path(sys.argv[1])
-    palfile = Path('PALETTE.DAT')
 
     reinit_globals(workdir)
-    read_palette(palfile)
+
+    # Try to load the palette
+    # Always prefer PNG since it's way easier to work with
+    if Path('PALETTE.PNG').exists():
+        read_palette_png(Path('PALETTE.PNG'))
+    elif Path('palette.png').exists():
+        read_palette_png(Path('palette.png'))
+    else:
+        read_palette_dat(Path('PALETTE.DAT'))
+
     build_art(workdir)
 
 if __name__ == "__main__":
