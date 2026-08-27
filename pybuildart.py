@@ -6,7 +6,6 @@ from pathlib import Path
 from array import array
 from contextlib import contextmanager
 import toml
-from math import floor
 
 # DO NOT CHANGE
 ART_VERSION = 1
@@ -32,7 +31,7 @@ C_UCHAR3_UNPACK = struct.Struct(C_UCHAR3).unpack_from
 
 # TOML config
 # this set isn't used anywhere, reference only
-TILE_CONFIG_OPTIONS: set[str] = { 'x', 'y', 'frames', 'animtype', 'speed', 'dither', 'offscorrect', 'nocorrectx', 'nocorrecty', 'correct_pivot_x', 'correct_pivot_y', 'lambda', 'alphacut', 'satcorrect_tries', 'satcorrect_threshold' }
+TILE_CONFIG_OPTIONS: set[str] = { 'x', 'y', 'frames', 'animtype', 'speed', 'dither', 'offscorrect', 'nocorrectx', 'nocorrecty', 'correct_pivot_x', 'correct_pivot_y', 'lambda', 'alphacut', 'satcorrect_tries', 'satcorrect_threshold', 'downscale', 'force_downscale' }
 
 # hardcode global keys here!!!
 ART_CONFIG_OPTIONS: set[str] = { 'start', 'length' }
@@ -574,17 +573,24 @@ def rdpd(input_img: Image.Image, ref_img: Image.Image) -> Image.Image:
     else:
         return Image.frombytes("RGB", (oSizeX, oSizeY), bytes(oImg))
 
-def CorrectImageSize(image: Image.Image, lambda_: float) -> Image.Image:
+def CorrectImageSize(image: Image.Image, lambda_: float, downscale: float, force_downscale: bool) -> Image.Image:
     global g_last_lambda
     image2 = image
 
     # Is this actually correct, or does this break the Classic renderer?
-    if (image.size[0] * image.size[1]) > MAX_TILE_SIZE_SQUARE:
+    if (image.size[0] * image.size[1]) > MAX_TILE_SIZE_SQUARE or force_downscale:
         width_ratio = MAX_TILE_SIZE / image.size[0]
         height_ratio = MAX_TILE_SIZE / image.size[1]
         
         # Use the smaller ratio to maintain aspect ratio and fit within bounds
         scale_ratio = min(width_ratio, height_ratio)
+
+        # Don't scale up to max size!
+        if force_downscale:
+            scale_ratio = 1.0
+
+        if downscale > 0.0:
+                scale_ratio *= (100.0 - downscale) / 100.0
         
         new_width = int(image.size[0] * scale_ratio)
         new_height = int(image.size[1] * scale_ratio)
@@ -656,9 +662,9 @@ def correct_offset(old_size: int, new_size: int, old_offset: int, old_pivot: int
     """
     if isinstance(old_pivot, int) and isinstance(new_pivot, int):
         cx = old_offset + (old_pivot - old_size) / 2.0
-        return floor(( cx - (new_pivot - new_size) / 2.0))
+        return math.floor(( cx - (new_pivot - new_size) / 2.0))
     else:
-        return floor(old_offset + (new_size - old_size) / 2.0)
+        return math.floor(old_offset + (new_size - old_size) / 2.0)
 
 def print_usage(error: bool) -> None:
     print("""Usage: pyartbuild [art_id]
@@ -674,7 +680,7 @@ def print_usage(error: bool) -> None:
        The directory containing the input images needs to have a
        config.toml file, which gets generated on first use.
        Each tile can have attributes set in this file by specifying
-       [tilenumber] with the following properties:
+       [\"tilenumber\"] with the following properties:
        'x' & 'y'         - configures offset
        'frames'          - specifies number of frames part of animation
        'speed'           - speed of the animation
@@ -714,7 +720,11 @@ def print_usage(error: bool) -> None:
                            colored speckles or lines artifacts from palettization.
                            Default is 0. Recommended is 4, adjust for desired result.
        'satcorrect_threshold' - Value of image complexity required to restrict the
-                                saturation correction testing range. Default is 10.""")
+                                saturation correction testing range. Default is 10.
+       'downscale'       - Percentage on how much to downscale tiles that exceed the
+                           maximum tile size limit. Default is 0.
+       'force_downscale' - Boolean, whether to forcefully downscale tiles even if they
+                           fit inside the size limit.""")
 
     if error:
         sys.exit(1)
@@ -743,8 +753,8 @@ def configgetattrib_float(tilenum: int, attrib: str) -> float:
         if attrib in g_config_lut[tilenum].keys():
             if isinstance(g_config_lut[tilenum][attrib], str):
                 s_attrib = str(g_config_lut[tilenum][attrib]).lower()
-                if attrib == 'dither' or attrib == 'nocorrectx' or attrib == 'nocorrecty':
-                    if s_attrib == "true":
+                if attrib == 'dither' or attrib == 'nocorrectx' or attrib == 'nocorrecty' or attrib == 'force_downscale':
+                    if s_attrib == "true" or s_attrib == "True":
                         return 1
                     else:
                         return 0
@@ -829,10 +839,10 @@ def process_tile(tilenum: int, img: Image.Image) -> None:
     lamb: float = configgetattrib_float(tilenum, 'lambda') if configcheckattrib(tilenum, 'lambda') else -1.0
     if lamb > 3.3:
         # TODO: Unify error messages!
-        print(f"Tile {tilenum}'s 'lambda' value ({lamb}) exceeds the maximum of 3.3! Clamping!")
+        print(f"WARNING: Tile {tilenum}'s 'lambda' value ({lamb}) exceeds the maximum of 3.3! Clamping!")
         lamb = 3.3
 
-    img = CorrectImageSize(img, lamb)
+    img = CorrectImageSize(img, lamb, configgetattrib_float(tilenum, 'downscale'), bool(configgetattrib_int(tilenum, 'force_downscale')))
     g_art_tilesizex[tilenum] = img.size[0]
     g_art_tilesizey[tilenum] = img.size[1]
 
