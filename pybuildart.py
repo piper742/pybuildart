@@ -14,8 +14,8 @@ ART_VERSION = 1
 # I don't know what is actually the max tile size for BUILD (probably sizeof(short) ^ 2),
 # but I feel like this is a sensible maximum from an aesthetic/size point of view
 # TODO: Check if all of D3Ds tiles don't exceed this
-MAX_TILE_SIZE = 256.0
-MAX_TILE_SIZE_SQUARE = MAX_TILE_SIZE * MAX_TILE_SIZE
+MAX_TILE_SIZE: int = 256
+MAX_TILE_SIZE_SQUARE: int = MAX_TILE_SIZE * MAX_TILE_SIZE
 
 # DO NOT CHANGE
 C_SHORT = "<h"
@@ -36,9 +36,9 @@ C_UCHAR3_UNPACK = struct.Struct(C_UCHAR3).unpack_from
 TILE_CONFIG_OPTIONS: set[str] = { 'x', 'y', 'frames', 'animtype', 'speed', 'dither', 'offscorrect', 'nocorrectx', 'nocorrecty', 'correct_pivot_x', 'correct_pivot_y', 'lambda', 'alphacut', 'satcorrect_tries', 'satcorrect_threshold', 'downscale', 'force_downscale' }
 
 # hardcode global keys here!!!
-ART_CONFIG_OPTIONS: set[str] = { 'start', 'length' }
+ART_CONFIG_OPTIONS: set[str] = { 'start', 'length', 'expanded_limits' }
 # Config to create if one isn't present
-DEFAULT_CONFIG: dict[str, str | int | float] = {'start': 0, 'length': 256}
+DEFAULT_CONFIG: dict[str, str | int | float] = {'start': 0, 'length': 256, 'expanded_limits': 0}
 # Config which applies globally to the entire resulting ART file
 g_config = dict()
 # Per-tile config dict lookup table
@@ -127,7 +127,7 @@ def recalculate_colorspace_lut(lambda_: float) -> None:
 
 def reinit_globals(filep: Path) -> None:
     "Reads in config, and accomodates for ART file size"
-    global g_art_numtiles, g_art_tilesend, g_art_tilesstart, g_art_tilesizey, g_art_tilesizex, g_art_picanms, g_art_tile_data
+    global g_art_numtiles, g_art_tilesend, g_art_tilesstart, g_art_tilesizey, g_art_tilesizex, g_art_picanms, g_art_tile_data, g_config, MAX_TILE_SIZE, MAX_TILE_SIZE_SQUARE
 
     try:
         read_config(filep / 'config.toml')
@@ -135,6 +135,7 @@ def reinit_globals(filep: Path) -> None:
         if not (filep / 'config.toml').exists():
             with open((filep / 'config.toml'), "w") as f:
                 print("Config file not present, creating default!")
+                g_config = DEFAULT_CONFIG
                 _ = toml.dump(o=DEFAULT_CONFIG, f=f)
         return
 
@@ -158,6 +159,14 @@ def reinit_globals(filep: Path) -> None:
     g_art_tilesizey = array('H', [0] * g_art_numtiles)
     g_art_picanms = array('l', [0] * g_art_numtiles)
     g_art_tile_data = [bytes(0)] * g_art_numtiles
+
+    if gconfigattrib_int('expanded_limits'):
+        # Setting this to one makes it compatible with source ports/tools implementing
+        # the ART specification found in buildinf.txt (int16's max value)
+        # Setting it to 2 makes it compatible with EDuke32's expanded limit (uint16's max value)
+        # Kinda ugly, but python just let's this happen
+        MAX_TILE_SIZE = 0x10000 if 1 < gconfigattrib_int('expanded_limits') else 0x8000
+        MAX_TILE_SIZE_SQUARE = MAX_TILE_SIZE * MAX_TILE_SIZE
 
     # Do this on-the-fly to not waste startup time, in case
     # we're not even utilizing RDPD
@@ -588,7 +597,7 @@ def CorrectImageSize(image: Image.Image, lambda_: float, downscale: float, force
         scale_ratio = min(width_ratio, height_ratio)
 
         # Don't scale up to max size!
-        if force_downscale:
+        if force_downscale and (image.size[0] * image.size[1]) < MAX_TILE_SIZE_SQUARE:
             scale_ratio = 1.0
 
         if downscale > 0.0:
